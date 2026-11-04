@@ -7,7 +7,7 @@ durability decisions recorded along the way, so you can talk about them in an
 interview.
 
 **Status:** In progress, one feature per day, pushed daily.
-Day 2 is done, 2026-11-03. The project is finished when every item below is checked off.
+Day 3 is done, 2026-11-04. The project is finished when every item below is checked off.
 
 ## What it does so far
 - `POST /jobs`, enqueue a job with a handler name, a payload, and an optional
@@ -20,6 +20,9 @@ Day 2 is done, 2026-11-03. The project is finished when every item below is chec
 - Same idempotency key returns the same job, never a duplicate
 - `POST /jobs` accepts run_at or delay_seconds, and the worker skips jobs
   whose run time has not arrived yet, so delayed jobs never run early
+- `POST /jobs` accepts priority, default 0. Among due jobs, higher priority
+  runs first, then earlier run_at, then lower id, so priority never lets a
+  future job run early
 
 ## Stack
 Python, FastAPI, SQLite for job persistence.
@@ -38,7 +41,7 @@ pytest
 ## Daily build plan (one feature plus tests per day)
 - [x] Day 1, Core queue, SQLite, worker, retry, dead letter, idempotency
 - [x] Day 2, Delayed jobs, run at a future time, 2026-11-03
-- [ ] Day 3, Priority queue
+- [x] Day 3, Priority queue, 2026-11-04
 - [ ] Day 4, Multiple workers, concurrency
 - [ ] Day 5, Job progress and cancellation
 - [ ] Day 6, Dead letter inspection and requeue endpoint
@@ -67,3 +70,7 @@ pytest
   a separate timer. The worker only claims due jobs, ordered by run_at, so a
   delayed job survives a restart and still runs at the right time, and a
   future job cannot jump ahead of a due job.
+- Priority is a plain integer column on the same job row, default 0, with
+  higher meaning sooner. Ordering is done in the claim query itself, by
+  priority, then run_at, then id, so the worker needs no in memory sort and
+  the ordering rule lives in one place.

@@ -1,4 +1,4 @@
-"""HTTP API around the job queue, including delayed jobs."""
+"""HTTP API around the job queue, including delayed jobs and priority."""
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
@@ -15,6 +15,7 @@ class EnqueueRequest(BaseModel):
     idempotency_key: str | None = None
     run_at: float | None = None
     delay_seconds: float | None = None
+    priority: int = 0
 
 
 @app.post("/jobs")
@@ -22,6 +23,7 @@ def enqueue(req: EnqueueRequest):
     return jobs.enqueue(
         req.handler, req.payload, req.max_attempts, req.idempotency_key,
         run_at=req.run_at, delay_seconds=req.delay_seconds,
+        priority=req.priority,
     )
 
 

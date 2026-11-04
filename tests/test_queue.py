@@ -68,3 +68,33 @@ def test_fail_once_recovers():
     assert q.get(job["id"])["status"] == "pending"
     q.process_next()
     assert q.get(job["id"])["status"] == "completed"
+
+
+def test_priority_jumps_queue():
+    q = fresh_queue()
+    low = q.enqueue("echo", {"message": "low"}, priority=0)
+    high = q.enqueue("echo", {"message": "high"}, priority=10)
+    assert q.process_next()["id"] == high["id"]
+    assert q.process_next()["id"] == low["id"]
+
+
+def test_same_priority_falls_back_to_run_at():
+    q = fresh_queue()
+    later = q.enqueue("echo", {"message": "later"}, run_at=2000, priority=5)
+    sooner = q.enqueue("echo", {"message": "sooner"}, run_at=1500, priority=5)
+    assert q.process_next(now=2500)["id"] == sooner["id"]
+    assert q.process_next(now=2500)["id"] == later["id"]
+
+
+def test_priority_does_not_beat_delay():
+    q = fresh_queue()
+    future = q.enqueue("echo", {"message": "future"}, run_at=5000, priority=99)
+    due = q.enqueue("echo", {"message": "due"}, run_at=1000, priority=0)
+    assert q.process_next(now=2000)["id"] == due["id"]
+    assert q.get(future["id"])["status"] == "pending"
+
+
+def test_default_priority_is_zero():
+    q = fresh_queue()
+    job = q.enqueue("echo", {"message": "plain"})
+    assert job["priority"] == 0

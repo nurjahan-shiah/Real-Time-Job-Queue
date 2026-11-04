@@ -1,4 +1,4 @@
-"""SQLite backed job queue with retry, dead letter, idempotency, delayed jobs."""
+"""SQLite backed job queue with retry, dead letter, idempotency, delayed jobs, priority."""
 import sqlite3
 import time
 from pathlib import Path
@@ -43,11 +43,14 @@ class JobQueue:
             "attempts INTEGER NOT NULL DEFAULT 0, "
             "max_attempts INTEGER NOT NULL DEFAULT 3, "
             "idempotency_key TEXT UNIQUE, result TEXT, error TEXT, "
-            "created_at REAL NOT NULL, run_at REAL NOT NULL DEFAULT 0)"
+            "created_at REAL NOT NULL, run_at REAL NOT NULL DEFAULT 0, "
+            "priority INTEGER NOT NULL DEFAULT 0)"
         )
         columns = [r[1] for r in conn.execute("PRAGMA table_info(jobs)")]
         if "run_at" not in columns:
             conn.execute("ALTER TABLE jobs ADD COLUMN run_at REAL NOT NULL DEFAULT 0")
+        if "priority" not in columns:
+            conn.execute("ALTER TABLE jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT 0")
         conn.commit()
         conn.close()
 
@@ -57,7 +60,7 @@ class JobQueue:
         return conn
 
     def enqueue(self, handler_name, payload, max_attempts=3, idempotency_key=None,
-                run_at=None, delay_seconds=None):
+                run_at=None, delay_seconds=None, priority=0):
         import json
 
         conn = self._conn()
@@ -77,10 +80,10 @@ class JobQueue:
         else:
             effective_run_at = now
         cur = conn.execute(
-            "INSERT INTO jobs (handler, payload, max_attempts, idempotency_key, created_at, run_at)"
-            " VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO jobs (handler, payload, max_attempts, idempotency_key, created_at, run_at, priority)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
             (handler_name, json.dumps(payload), max_attempts, idempotency_key, now,
-             effective_run_at),
+             effective_run_at, priority),
         )
         job_id = cur.lastrowid
         conn.commit()
@@ -114,7 +117,9 @@ class JobQueue:
         """Claim one due pending job, run it, retry or dead letter it. Returns the job or None.
 
         A job is due when its run_at time has passed. Future jobs stay pending
-        and are skipped, so a delayed job never runs early.
+        and are skipped, so a delayed job never runs early. Among due jobs,
+        higher priority wins first, then earlier run_at, then lower id, so
+        priority never lets a future job jump ahead of a due job.
         """
         import json
 
@@ -123,7 +128,7 @@ class JobQueue:
         conn = self._conn()
         row = conn.execute(
             "SELECT * FROM jobs WHERE status = 'pending' AND run_at <= ? "
-            "ORDER BY run_at ASC, id ASC LIMIT 1",
+            "ORDER BY priority DESC, run_at ASC, id ASC LIMIT 1",
             (now,),
         ).fetchone()
         if row is None:
