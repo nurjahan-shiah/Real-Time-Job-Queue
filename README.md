@@ -7,7 +7,7 @@ durability decisions recorded along the way, so you can talk about them in an
 interview.
 
 **Status:** In progress, one feature per day, pushed daily.
-Day 1 is done. The project is finished when every item below is checked off.
+Day 2 is done, 2026-11-03. The project is finished when every item below is checked off.
 
 ## What it does so far
 - `POST /jobs`, enqueue a job with a handler name, a payload, and an optional
@@ -18,6 +18,8 @@ Day 1 is done. The project is finished when every item below is checked off.
 - A worker that claims a job, runs its handler, retries on failure up to the
   max attempts, then moves it to the dead letter status
 - Same idempotency key returns the same job, never a duplicate
+- `POST /jobs` accepts run_at or delay_seconds, and the worker skips jobs
+  whose run time has not arrived yet, so delayed jobs never run early
 
 ## Stack
 Python, FastAPI, SQLite for job persistence.
@@ -35,7 +37,7 @@ pytest
 
 ## Daily build plan (one feature plus tests per day)
 - [x] Day 1, Core queue, SQLite, worker, retry, dead letter, idempotency
-- [ ] Day 2, Delayed jobs, run at a future time
+- [x] Day 2, Delayed jobs, run at a future time, 2026-11-03
 - [ ] Day 3, Priority queue
 - [ ] Day 4, Multiple workers, concurrency
 - [ ] Day 5, Job progress and cancellation
@@ -61,3 +63,7 @@ pytest
 - Idempotency is enforced on the key at enqueue time. A second enqueue with
   the same key returns the original job, which is the safe behaviour for
   clients that retry a request.
+- Delayed jobs are stored with a run_at time in the same SQLite row, not in
+  a separate timer. The worker only claims due jobs, ordered by run_at, so a
+  delayed job survives a restart and still runs at the right time, and a
+  future job cannot jump ahead of a due job.

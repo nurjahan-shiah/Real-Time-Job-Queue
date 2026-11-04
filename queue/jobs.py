@@ -1,4 +1,4 @@
-"""Day 1, SQLite backed job queue with retry, dead letter, idempotency."""
+"""SQLite backed job queue with retry, dead letter, idempotency, delayed jobs."""
 import sqlite3
 import time
 from pathlib import Path
@@ -43,8 +43,11 @@ class JobQueue:
             "attempts INTEGER NOT NULL DEFAULT 0, "
             "max_attempts INTEGER NOT NULL DEFAULT 3, "
             "idempotency_key TEXT UNIQUE, result TEXT, error TEXT, "
-            "created_at REAL NOT NULL)"
+            "created_at REAL NOT NULL, run_at REAL NOT NULL DEFAULT 0)"
         )
+        columns = [r[1] for r in conn.execute("PRAGMA table_info(jobs)")]
+        if "run_at" not in columns:
+            conn.execute("ALTER TABLE jobs ADD COLUMN run_at REAL NOT NULL DEFAULT 0")
         conn.commit()
         conn.close()
 
@@ -53,7 +56,8 @@ class JobQueue:
         conn.row_factory = sqlite3.Row
         return conn
 
-    def enqueue(self, handler_name, payload, max_attempts=3, idempotency_key=None):
+    def enqueue(self, handler_name, payload, max_attempts=3, idempotency_key=None,
+                run_at=None, delay_seconds=None):
         import json
 
         conn = self._conn()
@@ -65,10 +69,18 @@ class JobQueue:
             if row:
                 conn.close()
                 return dict(row)
+        now = time.time()
+        if delay_seconds is not None:
+            effective_run_at = now + delay_seconds
+        elif run_at is not None:
+            effective_run_at = run_at
+        else:
+            effective_run_at = now
         cur = conn.execute(
-            "INSERT INTO jobs (handler, payload, max_attempts, idempotency_key, created_at)"
-            " VALUES (?, ?, ?, ?, ?)",
-            (handler_name, json.dumps(payload), max_attempts, idempotency_key, time.time()),
+            "INSERT INTO jobs (handler, payload, max_attempts, idempotency_key, created_at, run_at)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (handler_name, json.dumps(payload), max_attempts, idempotency_key, now,
+             effective_run_at),
         )
         job_id = cur.lastrowid
         conn.commit()
@@ -98,13 +110,21 @@ class JobQueue:
         conn.close()
         return {r["status"]: r["n"] for r in rows}
 
-    def process_next(self):
-        """Claim one pending job, run it, retry or dead letter it. Returns the job or None."""
+    def process_next(self, now=None):
+        """Claim one due pending job, run it, retry or dead letter it. Returns the job or None.
+
+        A job is due when its run_at time has passed. Future jobs stay pending
+        and are skipped, so a delayed job never runs early.
+        """
         import json
 
+        if now is None:
+            now = time.time()
         conn = self._conn()
         row = conn.execute(
-            "SELECT * FROM jobs WHERE status = 'pending' ORDER BY id ASC LIMIT 1"
+            "SELECT * FROM jobs WHERE status = 'pending' AND run_at <= ? "
+            "ORDER BY run_at ASC, id ASC LIMIT 1",
+            (now,),
         ).fetchone()
         if row is None:
             conn.close()
