@@ -1,0 +1,44 @@
+"""Day 1, HTTP API around the job queue."""
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+
+from queue.jobs import JobQueue
+
+app = FastAPI(title="Real Time Job Queue")
+jobs = JobQueue()
+
+
+class EnqueueRequest(BaseModel):
+    handler: str
+    payload: dict = {}
+    max_attempts: int = 3
+    idempotency_key: str | None = None
+
+
+@app.post("/jobs")
+def enqueue(req: EnqueueRequest):
+    return jobs.enqueue(req.handler, req.payload, req.max_attempts, req.idempotency_key)
+
+
+@app.get("/jobs/{job_id}")
+def get_job(job_id: int):
+    job = jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job
+
+
+@app.get("/jobs")
+def list_jobs():
+    return jobs.list_jobs()
+
+
+@app.get("/stats")
+def stats():
+    return jobs.stats()
+
+
+@app.post("/process-next")
+def process_next():
+    job = jobs.process_next()
+    return job if job else {"processed": None}
