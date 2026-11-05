@@ -1,7 +1,10 @@
 import tempfile
+import threading
+import time
 from pathlib import Path
 
-from queue.jobs import JobQueue
+from queue.jobs import HANDLERS, JobQueue
+from queue.workers import Worker, run_workers
 
 
 def fresh_queue():
@@ -98,3 +101,72 @@ def test_default_priority_is_zero():
     q = fresh_queue()
     job = q.enqueue("echo", {"message": "plain"})
     assert job["priority"] == 0
+
+
+def test_claim_records_worker_id():
+    q = fresh_queue()
+    job = q.enqueue("echo", {"message": "hi"})
+    done = q.process_next(worker_id="worker-7")
+    assert done["id"] == job["id"]
+    assert done["claimed_by"] == "worker-7"
+
+
+def test_atomic_claim_gives_each_job_to_one_worker():
+    q = fresh_queue()
+    seen = []
+    lock = threading.Lock()
+
+    def counting(payload):
+        with lock:
+            seen.append(payload["n"])
+        time.sleep(0.02)
+        return {"n": payload["n"]}
+
+    HANDLERS["counting"] = counting
+    for n in range(20):
+        q.enqueue("counting", {"n": n})
+
+    def drain():
+        while q.process_next(worker_id=threading.current_thread().name) is not None:
+            pass
+
+    threads = [threading.Thread(target=drain) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert sorted(seen) == list(range(20))
+    jobs = q.list_jobs()
+    assert len(jobs) == 20
+    assert all(job["status"] == "completed" for job in jobs)
+    assert all(job["attempts"] == 1 for job in jobs)
+    assert len({job["claimed_by"] for job in jobs}) > 1
+
+
+def test_workers_run_jobs_in_parallel():
+    q = fresh_queue()
+    for _ in range(4):
+        q.enqueue("slow", {"seconds": 0.3})
+    workers = run_workers(q, 2, poll_interval=0.01)
+    start = time.monotonic()
+    try:
+        while time.monotonic() - start < 5:
+            if all(job["status"] == "completed" for job in q.list_jobs()):
+                break
+            time.sleep(0.05)
+    finally:
+        for worker in workers:
+            worker.stop()
+    assert all(job["status"] == "completed" for job in q.list_jobs())
+    assert sum(worker.processed for worker in workers) == 4
+    assert time.monotonic() - start < 1.0
+
+
+def test_worker_run_until_empty():
+    q = fresh_queue()
+    for i in range(3):
+        q.enqueue("echo", {"message": str(i)})
+    worker = Worker(q, "worker-1")
+    worker.run_until_empty()
+    assert worker.processed == 3
+    assert all(job["status"] == "completed" for job in q.list_jobs())

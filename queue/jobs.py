@@ -1,4 +1,4 @@
-"""SQLite backed job queue with retry, dead letter, idempotency, delayed jobs, priority."""
+"""SQLite backed job queue with retry, dead letter, idempotency, delayed jobs, priority, multiple workers."""
 import sqlite3
 import time
 from pathlib import Path
@@ -31,6 +31,13 @@ def fail_once_handler(payload):
     return {"ok": True}
 
 
+@handler("slow")
+def slow_handler(payload):
+    seconds = payload.get("seconds", 0.2)
+    time.sleep(seconds)
+    return {"slept": seconds}
+
+
 class JobQueue:
     def __init__(self, db_path=None):
         self.db_path = Path(db_path) if db_path else Path(__file__).parent / "jobs.db"
@@ -44,19 +51,23 @@ class JobQueue:
             "max_attempts INTEGER NOT NULL DEFAULT 3, "
             "idempotency_key TEXT UNIQUE, result TEXT, error TEXT, "
             "created_at REAL NOT NULL, run_at REAL NOT NULL DEFAULT 0, "
-            "priority INTEGER NOT NULL DEFAULT 0)"
+            "priority INTEGER NOT NULL DEFAULT 0, claimed_by TEXT)"
         )
         columns = [r[1] for r in conn.execute("PRAGMA table_info(jobs)")]
         if "run_at" not in columns:
             conn.execute("ALTER TABLE jobs ADD COLUMN run_at REAL NOT NULL DEFAULT 0")
         if "priority" not in columns:
             conn.execute("ALTER TABLE jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT 0")
+        if "claimed_by" not in columns:
+            conn.execute("ALTER TABLE jobs ADD COLUMN claimed_by TEXT")
         conn.commit()
         conn.close()
 
     def _conn(self):
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=30.0)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=30000")
         return conn
 
     def enqueue(self, handler_name, payload, max_attempts=3, idempotency_key=None,
@@ -113,31 +124,35 @@ class JobQueue:
         conn.close()
         return {r["status"]: r["n"] for r in rows}
 
-    def process_next(self, now=None):
+    def process_next(self, now=None, worker_id=None):
         """Claim one due pending job, run it, retry or dead letter it. Returns the job or None.
 
         A job is due when its run_at time has passed. Future jobs stay pending
         and are skipped, so a delayed job never runs early. Among due jobs,
         higher priority wins first, then earlier run_at, then lower id, so
         priority never lets a future job jump ahead of a due job.
+
+        The claim is one atomic UPDATE, so two workers calling this at the
+        same time can never claim the same job. The worker that claimed a job
+        is recorded in claimed_by, so you can see who ran what.
         """
         import json
 
         if now is None:
             now = time.time()
+        worker_id = worker_id or "worker-1"
         conn = self._conn()
         row = conn.execute(
-            "SELECT * FROM jobs WHERE status = 'pending' AND run_at <= ? "
-            "ORDER BY priority DESC, run_at ASC, id ASC LIMIT 1",
-            (now,),
+            "UPDATE jobs SET status = 'running', claimed_by = ? WHERE id = ("
+            "SELECT id FROM jobs WHERE status = 'pending' AND run_at <= ? "
+            "ORDER BY priority DESC, run_at ASC, id ASC LIMIT 1) RETURNING *",
+            (worker_id, now),
         ).fetchone()
-        if row is None:
-            conn.close()
-            return None
-        job = dict(row)
-        conn.execute("UPDATE jobs SET status = 'running' WHERE id = ?", (job["id"],))
         conn.commit()
         conn.close()
+        if row is None:
+            return None
+        job = dict(row)
         fn = HANDLERS.get(job["handler"])
         try:
             if fn is None:

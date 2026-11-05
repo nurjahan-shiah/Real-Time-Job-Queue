@@ -7,7 +7,7 @@ durability decisions recorded along the way, so you can talk about them in an
 interview.
 
 **Status:** In progress, one feature per day, pushed daily.
-Day 3 is done, 2026-11-04. The project is finished when every item below is checked off.
+Day 4 is done, 2026-11-05. The project is finished when every item below is checked off.
 
 ## What it does so far
 - `POST /jobs`, enqueue a job with a handler name, a payload, and an optional
@@ -23,6 +23,10 @@ Day 3 is done, 2026-11-04. The project is finished when every item below is chec
 - `POST /jobs` accepts priority, default 0. Among due jobs, higher priority
   runs first, then earlier run_at, then lower id, so priority never lets a
   future job run early
+- Several workers can run at once, each in its own thread, and the atomic
+  claim means no job is ever run twice. Start 4 workers with
+  `python -m queue.workers 4`, and each job records which worker claimed it
+  in claimed_by
 
 ## Stack
 Python, FastAPI, SQLite for job persistence.
@@ -42,7 +46,7 @@ pytest
 - [x] Day 1, Core queue, SQLite, worker, retry, dead letter, idempotency
 - [x] Day 2, Delayed jobs, run at a future time, 2026-11-03
 - [x] Day 3, Priority queue, 2026-11-04
-- [ ] Day 4, Multiple workers, concurrency
+- [x] Day 4, Multiple workers, concurrency, 2026-11-05
 - [ ] Day 5, Job progress and cancellation
 - [ ] Day 6, Dead letter inspection and requeue endpoint
 - [ ] Day 7, Persistence recovery on restart
@@ -74,3 +78,9 @@ pytest
   higher meaning sooner. Ordering is done in the claim query itself, by
   priority, then run_at, then id, so the worker needs no in memory sort and
   the ordering rule lives in one place.
+- Claiming is one atomic UPDATE with a subquery and RETURNING, not a select
+  followed by an update, so two workers racing for the same job cannot both
+  win it. SQLite serialises the writers, WAL mode and a 30 second busy
+  timeout let workers wait their turn instead of failing, and claimed_by on
+  the job row records which worker won, which makes duplicate runs visible
+  in tests and in production.
