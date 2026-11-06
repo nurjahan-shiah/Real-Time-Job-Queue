@@ -170,3 +170,101 @@ def test_worker_run_until_empty():
     worker.run_until_empty()
     assert worker.processed == 3
     assert all(job["status"] == "completed" for job in q.list_jobs())
+
+
+def test_progress_defaults_to_zero():
+    q = fresh_queue()
+    job = q.enqueue("echo", {"message": "hi"})
+    assert job["progress"] == 0
+    assert job["cancel_requested"] == 0
+
+
+def test_progress_reported_by_handler():
+    q = fresh_queue()
+    job = q.enqueue("progress_demo", {"steps": 4})
+    done = q.process_next()
+    assert done["id"] == job["id"]
+    assert done["status"] == "completed"
+    assert done["progress"] == 100
+    assert done["progress_message"] == "step 4 of 4"
+
+
+def test_report_progress_clamps_to_0_100():
+    q = fresh_queue()
+    job = q.enqueue("echo", {"message": "hi"})
+    q.report_progress(job["id"], 150, "too far")
+    assert q.get(job["id"])["progress"] == 100
+    q.report_progress(job["id"], -5)
+    assert q.get(job["id"])["progress"] == 0
+
+
+def test_cancel_pending_job_never_runs():
+    q = fresh_queue()
+    job = q.enqueue("echo", {"message": "hi"})
+    cancelled = q.cancel(job["id"])
+    assert cancelled["status"] == "cancelled"
+    assert cancelled["cancel_requested"] == 1
+    assert q.process_next() is None
+    assert q.get(job["id"])["status"] == "cancelled"
+    assert q.get(job["id"])["attempts"] == 0
+
+
+def test_cancel_running_job_stops_it_cooperatively():
+    q = fresh_queue()
+    job = q.enqueue("long", {"steps": 20})
+    result = {}
+
+    def run():
+        result["done"] = q.process_next()
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            current = q.get(job["id"])
+            if current["status"] == "running" and current["progress"] > 0:
+                break
+            time.sleep(0.02)
+        cancelled = q.cancel(job["id"])
+        assert cancelled["status"] == "running"
+        assert cancelled["cancel_requested"] == 1
+    finally:
+        thread.join(timeout=5)
+    assert not thread.is_alive()
+    done = result["done"]
+    assert done["status"] == "cancelled"
+    assert done["progress"] < 100
+
+
+def test_cancel_completed_job_is_a_noop():
+    q = fresh_queue()
+    job = q.enqueue("echo", {"message": "hi"})
+    q.process_next()
+    assert q.cancel(job["id"])["status"] == "completed"
+
+
+def test_cancel_unknown_job_returns_none():
+    q = fresh_queue()
+    assert q.cancel(9999) is None
+
+
+def test_cancel_endpoint():
+    import pytest
+    from fastapi import HTTPException
+
+    import app.main as main
+
+    q = fresh_queue()
+    old_jobs = main.jobs
+    main.jobs = q
+    try:
+        job = main.enqueue(main.EnqueueRequest(handler="echo", payload={"message": "hi"}))
+        assert job["progress"] == 0
+        cancelled = main.cancel_job(job["id"])
+        assert cancelled["status"] == "cancelled"
+        with pytest.raises(HTTPException):
+            main.cancel_job(9999)
+        assert main.get_job(job["id"])["status"] == "cancelled"
+    finally:
+        main.jobs = old_jobs

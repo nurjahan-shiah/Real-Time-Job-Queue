@@ -1,4 +1,5 @@
-"""SQLite backed job queue with retry, dead letter, idempotency, delayed jobs, priority, multiple workers."""
+"""SQLite backed job queue with retry, dead letter, idempotency, delayed jobs, priority, multiple workers, progress, cancellation."""
+import inspect
 import sqlite3
 import time
 from pathlib import Path
@@ -38,6 +39,47 @@ def slow_handler(payload):
     return {"slept": seconds}
 
 
+@handler("progress_demo")
+def progress_demo_handler(payload, progress):
+    """Report progress in steps, so clients can poll GET /jobs/{id}."""
+    steps = payload.get("steps", 4)
+    for step in range(1, steps + 1):
+        progress(100.0 * step / steps, f"step {step} of {steps}")
+    return {"steps": steps}
+
+
+@handler("long")
+def long_handler(payload, progress):
+    """Cooperatively stoppable job, it checks for cancellation each step."""
+    steps = payload.get("steps", 10)
+    for step in range(1, steps + 1):
+        if progress.cancelled:
+            return {"cancelled": True, "stopped_at_step": step - 1}
+        time.sleep(0.05)
+        progress(100.0 * step / steps, f"step {step} of {steps}")
+    return {"steps": steps}
+
+
+class ProgressReporter:
+    """What a handler gets to report progress and check for cancellation.
+
+    Call it with a percent from 0 to 100 and an optional message, it writes
+    both to the job row, so GET /jobs/{id} shows live progress. Read
+    .cancelled to stop work early when a client asked to cancel the job.
+    """
+
+    def __init__(self, queue, job_id):
+        self._queue = queue
+        self.job_id = job_id
+
+    def __call__(self, percent, message=None):
+        self._queue.report_progress(self.job_id, percent, message)
+
+    @property
+    def cancelled(self):
+        return self._queue.is_cancel_requested(self.job_id)
+
+
 class JobQueue:
     def __init__(self, db_path=None):
         self.db_path = Path(db_path) if db_path else Path(__file__).parent / "jobs.db"
@@ -51,7 +93,9 @@ class JobQueue:
             "max_attempts INTEGER NOT NULL DEFAULT 3, "
             "idempotency_key TEXT UNIQUE, result TEXT, error TEXT, "
             "created_at REAL NOT NULL, run_at REAL NOT NULL DEFAULT 0, "
-            "priority INTEGER NOT NULL DEFAULT 0, claimed_by TEXT)"
+            "priority INTEGER NOT NULL DEFAULT 0, claimed_by TEXT, "
+            "progress REAL NOT NULL DEFAULT 0, progress_message TEXT, "
+            "cancel_requested INTEGER NOT NULL DEFAULT 0)"
         )
         columns = [r[1] for r in conn.execute("PRAGMA table_info(jobs)")]
         if "run_at" not in columns:
@@ -60,6 +104,12 @@ class JobQueue:
             conn.execute("ALTER TABLE jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT 0")
         if "claimed_by" not in columns:
             conn.execute("ALTER TABLE jobs ADD COLUMN claimed_by TEXT")
+        if "progress" not in columns:
+            conn.execute("ALTER TABLE jobs ADD COLUMN progress REAL NOT NULL DEFAULT 0")
+        if "progress_message" not in columns:
+            conn.execute("ALTER TABLE jobs ADD COLUMN progress_message TEXT")
+        if "cancel_requested" not in columns:
+            conn.execute("ALTER TABLE jobs ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0")
         conn.commit()
         conn.close()
 
@@ -124,6 +174,50 @@ class JobQueue:
         conn.close()
         return {r["status"]: r["n"] for r in rows}
 
+    def report_progress(self, job_id, percent, message=None):
+        """Store progress, clamped to 0 to 100, on the job row."""
+        percent = max(0.0, min(100.0, float(percent)))
+        conn = self._conn()
+        conn.execute(
+            "UPDATE jobs SET progress = ?, progress_message = ? WHERE id = ?",
+            (percent, message, job_id),
+        )
+        conn.commit()
+        conn.close()
+
+    def is_cancel_requested(self, job_id):
+        job = self.get(job_id)
+        return bool(job and job.get("cancel_requested"))
+
+    def cancel(self, job_id):
+        """Cancel a job. Returns the job, or None when it does not exist.
+
+        A pending job is cancelled at once and never runs. A running job
+        cannot be killed safely mid handler, so it is flagged instead: the
+        handler can check the flag and stop early, and the worker marks the
+        job cancelled instead of completed when the handler returns. A job
+        that is already completed, dead, or cancelled is left as it is.
+        """
+        job = self.get(job_id)
+        if job is None:
+            return None
+        if job["status"] in ("completed", "dead", "cancelled"):
+            return job
+        conn = self._conn()
+        if job["status"] == "pending":
+            conn.execute(
+                "UPDATE jobs SET status = 'cancelled', cancel_requested = 1 WHERE id = ?",
+                (job_id,),
+            )
+        else:
+            conn.execute(
+                "UPDATE jobs SET cancel_requested = 1 WHERE id = ?",
+                (job_id,),
+            )
+        conn.commit()
+        conn.close()
+        return self.get(job_id)
+
     def process_next(self, now=None, worker_id=None):
         """Claim one due pending job, run it, retry or dead letter it. Returns the job or None.
 
@@ -135,6 +229,10 @@ class JobQueue:
         The claim is one atomic UPDATE, so two workers calling this at the
         same time can never claim the same job. The worker that claimed a job
         is recorded in claimed_by, so you can see who ran what.
+
+        Handlers that accept a second argument get a progress reporter, so
+        they can report percent complete and check for cancellation. A job
+        cancelled while running ends as cancelled, not completed.
         """
         import json
 
@@ -154,21 +252,36 @@ class JobQueue:
             return None
         job = dict(row)
         fn = HANDLERS.get(job["handler"])
+        progress = ProgressReporter(self, job["id"])
         try:
             if fn is None:
                 raise RuntimeError(f"unknown handler: {job['handler']}")
-            result = fn(json.loads(job["payload"]))
+            if len(inspect.signature(fn).parameters) >= 2:
+                result = fn(json.loads(job["payload"]), progress)
+            else:
+                result = fn(json.loads(job["payload"]))
             conn = self._conn()
-            conn.execute(
-                "UPDATE jobs SET status = 'completed', result = ?, attempts = attempts + 1 WHERE id = ?",
-                (json.dumps(result), job["id"]),
-            )
+            if self.is_cancel_requested(job["id"]):
+                conn.execute(
+                    "UPDATE jobs SET status = 'cancelled', result = ?, attempts = attempts + 1 WHERE id = ?",
+                    (json.dumps(result), job["id"]),
+                )
+            else:
+                conn.execute(
+                    "UPDATE jobs SET status = 'completed', result = ?, attempts = attempts + 1 WHERE id = ?",
+                    (json.dumps(result), job["id"]),
+                )
             conn.commit()
             conn.close()
         except Exception as exc:  # noqa: BLE001, retry then dead letter
             conn = self._conn()
             attempts = job["attempts"] + 1
-            if attempts >= job["max_attempts"]:
+            if self.is_cancel_requested(job["id"]):
+                conn.execute(
+                    "UPDATE jobs SET status = 'cancelled', error = ?, attempts = ? WHERE id = ?",
+                    (str(exc), attempts, job["id"]),
+                )
+            elif attempts >= job["max_attempts"]:
                 conn.execute(
                     "UPDATE jobs SET status = 'dead', error = ?, attempts = ? WHERE id = ?",
                     (str(exc), attempts, job["id"]),

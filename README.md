@@ -7,7 +7,7 @@ durability decisions recorded along the way, so you can talk about them in an
 interview.
 
 **Status:** In progress, one feature per day, pushed daily.
-Day 4 is done, 2026-11-05. The project is finished when every item below is checked off.
+Day 5 is done, 2026-11-06. The project is finished when every item below is checked off.
 
 ## What it does so far
 - `POST /jobs`, enqueue a job with a handler name, a payload, and an optional
@@ -27,6 +27,11 @@ Day 4 is done, 2026-11-05. The project is finished when every item below is chec
   claim means no job is ever run twice. Start 4 workers with
   `python -m queue.workers 4`, and each job records which worker claimed it
   in claimed_by
+- Handlers can report progress from 0 to 100 with a message, stored on the
+  job row, so `GET /jobs/{id}` shows live progress while a job runs
+- `POST /jobs/{id}/cancel` cancels a pending job at once, so it never runs,
+  and flags a running job for cooperative cancellation, so it stops at the
+  next step and ends as cancelled instead of completed
 
 ## Stack
 Python, FastAPI, SQLite for job persistence.
@@ -47,7 +52,7 @@ pytest
 - [x] Day 2, Delayed jobs, run at a future time, 2026-11-03
 - [x] Day 3, Priority queue, 2026-11-04
 - [x] Day 4, Multiple workers, concurrency, 2026-11-05
-- [ ] Day 5, Job progress and cancellation
+- [x] Day 5, Job progress and cancellation, 2026-11-06
 - [ ] Day 6, Dead letter inspection and requeue endpoint
 - [ ] Day 7, Persistence recovery on restart
 - [ ] Day 8, Rate limiting per handler
@@ -84,3 +89,11 @@ pytest
   timeout let workers wait their turn instead of failing, and claimed_by on
   the job row records which worker won, which makes duplicate runs visible
   in tests and in production.
+- Progress is a plain percent and message on the same job row, written by a
+  reporter the worker hands to handlers that ask for one, so polling
+  `GET /jobs/{id}` is the progress API and no separate channel is needed.
+  Cancellation is cooperative, not a thread kill, because killing a thread
+  mid handler can corrupt shared state. A pending job is cancelled at once,
+  a running job gets a cancel_requested flag its handler checks each step,
+  and the worker marks it cancelled instead of completed when the handler
+  returns, so a cancelled job is never retried or dead lettered.
