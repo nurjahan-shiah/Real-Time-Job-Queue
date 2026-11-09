@@ -249,6 +249,89 @@ def test_cancel_unknown_job_returns_none():
     assert q.cancel(9999) is None
 
 
+def test_dead_letter_listed_with_error():
+    q = fresh_queue()
+    job = q.enqueue("nope", {}, max_attempts=1)
+    q.process_next()
+    dead = q.list_dead()
+    assert len(dead) == 1
+    assert dead[0]["id"] == job["id"]
+    assert dead[0]["status"] == "dead"
+    assert dead[0]["attempts"] == 1
+    assert "unknown handler" in dead[0]["error"]
+
+
+def test_dead_list_is_empty_when_nothing_died():
+    q = fresh_queue()
+    q.enqueue("echo", {"message": "hi"})
+    assert q.list_dead() == []
+
+
+def test_requeue_dead_job_runs_again():
+    q = fresh_queue()
+    calls = {"n": 0}
+
+    def flaky(payload):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise RuntimeError("flaky failure")
+        return {"ok": True}
+
+    HANDLERS["flaky"] = flaky
+    job = q.enqueue("flaky", {}, max_attempts=2)
+    q.process_next()
+    assert q.get(job["id"])["status"] == "pending"
+    q.process_next()
+    assert q.get(job["id"])["status"] == "dead"
+    again = q.requeue(job["id"])
+    assert again["status"] == "pending"
+    assert again["attempts"] == 0
+    assert again["error"] is None
+    assert again["result"] is None
+    done = q.process_next()
+    assert done["id"] == job["id"]
+    assert done["status"] == "completed"
+    assert '"ok": true' in done["result"]
+
+
+def test_requeue_live_job_is_a_noop():
+    q = fresh_queue()
+    pending = q.enqueue("echo", {"message": "hi"})
+    assert q.requeue(pending["id"])["status"] == "pending"
+    assert q.get(pending["id"])["attempts"] == 0
+    q.process_next()
+    assert q.requeue(pending["id"])["status"] == "completed"
+
+
+def test_requeue_unknown_job_returns_none():
+    q = fresh_queue()
+    assert q.requeue(9999) is None
+
+
+def test_dead_and_requeue_endpoints():
+    import pytest
+    from fastapi import HTTPException
+
+    import app.main as main
+
+    q = fresh_queue()
+    old_jobs = main.jobs
+    main.jobs = q
+    try:
+        job = main.enqueue(main.EnqueueRequest(handler="nope", payload={}, max_attempts=1))
+        main.process_next()
+        dead = main.list_dead()
+        assert len(dead) == 1
+        assert dead[0]["id"] == job["id"]
+        again = main.requeue_job(job["id"])
+        assert again["status"] == "pending"
+        assert main.list_dead() == []
+        with pytest.raises(HTTPException):
+            main.requeue_job(9999)
+    finally:
+        main.jobs = old_jobs
+
+
 def test_cancel_endpoint():
     import pytest
     from fastapi import HTTPException

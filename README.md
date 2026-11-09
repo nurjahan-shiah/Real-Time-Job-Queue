@@ -7,7 +7,7 @@ durability decisions recorded along the way, so you can talk about them in an
 interview.
 
 **Status:** In progress, one feature per day, pushed daily.
-Day 5 is done, 2026-11-06. The project is finished when every item below is checked off.
+Day 6 is done, 2026-11-07. The project is finished when every item below is checked off.
 
 ## What it does so far
 - `POST /jobs`, enqueue a job with a handler name, a payload, and an optional
@@ -32,6 +32,10 @@ Day 5 is done, 2026-11-06. The project is finished when every item below is chec
 - `POST /jobs/{id}/cancel` cancels a pending job at once, so it never runs,
   and flags a running job for cooperative cancellation, so it stops at the
   next step and ends as cancelled instead of completed
+- `GET /dead` lists dead letter jobs, newest first, with the error that
+  killed each one, so you can inspect failures without digging in the database
+- `POST /jobs/{id}/requeue` puts a dead job back in the queue with a fresh
+  attempt budget, so a fixed failure can run again without re-enqueueing it
 
 ## Stack
 Python, FastAPI, SQLite for job persistence.
@@ -53,7 +57,7 @@ pytest
 - [x] Day 3, Priority queue, 2026-11-04
 - [x] Day 4, Multiple workers, concurrency, 2026-11-05
 - [x] Day 5, Job progress and cancellation, 2026-11-06
-- [ ] Day 6, Dead letter inspection and requeue endpoint
+- [x] Day 6, Dead letter inspection and requeue endpoint, 2026-11-07
 - [ ] Day 7, Persistence recovery on restart
 - [ ] Day 8, Rate limiting per handler
 - [ ] Day 9, Job timeouts
@@ -97,3 +101,10 @@ pytest
   a running job gets a cancel_requested flag its handler checks each step,
   and the worker marks it cancelled instead of completed when the handler
   returns, so a cancelled job is never retried or dead lettered.
+- Dead letter inspection is a plain query on status, not a separate table,
+  so a dead job keeps its full history in one place and `GET /dead` is just
+  a filtered list. Requeue only accepts dead jobs and returns any other job
+  unchanged, so requeueing a live job can never duplicate work. A requeued
+  job keeps its handler, payload, priority, and idempotency key, but its
+  attempts, error, result, and progress are cleared and run_at is set to now,
+  so it runs again promptly with a fresh attempt budget.

@@ -1,4 +1,4 @@
-"""HTTP API around the job queue, including delayed jobs, priority, progress, and cancellation."""
+"""HTTP API around the job queue, including delayed jobs, priority, progress, cancellation, and dead letter requeue."""
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
@@ -41,6 +41,19 @@ def cancel_job(job_id: int):
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
     return job
+
+
+@app.post("/jobs/{job_id}/requeue")
+def requeue_job(job_id: int):
+    job = jobs.requeue(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job
+
+
+@app.get("/dead")
+def list_dead():
+    return jobs.list_dead()
 
 
 @app.get("/jobs")

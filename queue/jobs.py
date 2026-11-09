@@ -1,4 +1,4 @@
-"""SQLite backed job queue with retry, dead letter, idempotency, delayed jobs, priority, multiple workers, progress, cancellation."""
+"""SQLite backed job queue with retry, dead letter, idempotency, delayed jobs, priority, multiple workers, progress, cancellation, dead letter inspection, and requeue."""
 import inspect
 import sqlite3
 import time
@@ -214,6 +214,47 @@ class JobQueue:
                 "UPDATE jobs SET cancel_requested = 1 WHERE id = ?",
                 (job_id,),
             )
+        conn.commit()
+        conn.close()
+        return self.get(job_id)
+
+    def list_dead(self, limit=50):
+        """List dead letter jobs, newest first, with their last error.
+
+        A dead job is one that used up its attempts, so this is the
+        inspection view: handler, payload, attempts, and the error that
+        killed it, so you can decide whether it is worth requeueing.
+        """
+        conn = self._conn()
+        rows = conn.execute(
+            "SELECT * FROM jobs WHERE status = 'dead' ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+
+    def requeue(self, job_id):
+        """Put a dead job back in the queue. Returns the job, or None when it does not exist.
+
+        Only dead jobs are requeued. A job in any other status is returned
+        unchanged, so requeueing a live job can never duplicate work. The
+        requeued job keeps its handler, payload, priority, and idempotency
+        key, but attempts, error, result, and progress are cleared, and
+        run_at is set to now, so it runs again promptly with a fresh
+        attempt budget.
+        """
+        job = self.get(job_id)
+        if job is None:
+            return None
+        if job["status"] != "dead":
+            return job
+        conn = self._conn()
+        conn.execute(
+            "UPDATE jobs SET status = 'pending', attempts = 0, error = NULL, "
+            "result = NULL, progress = 0, progress_message = NULL, "
+            "cancel_requested = 0, claimed_by = NULL, run_at = ? WHERE id = ?",
+            (time.time(), job_id),
+        )
         conn.commit()
         conn.close()
         return self.get(job_id)
