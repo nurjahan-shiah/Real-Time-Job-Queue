@@ -7,7 +7,7 @@ durability decisions recorded along the way, so you can talk about them in an
 interview.
 
 **Status:** In progress, one feature per day, pushed daily.
-Day 6 is done, 2026-11-07. The project is finished when every item below is checked off.
+Day 7 is done, 2026-11-10. The project is finished when every item below is checked off.
 
 ## What it does so far
 - `POST /jobs`, enqueue a job with a handler name, a payload, and an optional
@@ -36,6 +36,10 @@ Day 6 is done, 2026-11-07. The project is finished when every item below is chec
   killed each one, so you can inspect failures without digging in the database
 - `POST /jobs/{id}/requeue` puts a dead job back in the queue with a fresh
   attempt budget, so a fixed failure can run again without re-enqueueing it
+- On startup, jobs left running by a crashed worker are recovered: a job
+  with attempts left goes back to pending with a fresh claim, a job out of
+  attempts is dead lettered, so a restart never loses work or leaves a job
+  stuck in running. `GET /recovery` shows what the last startup recovered
 
 ## Stack
 Python, FastAPI, SQLite for job persistence.
@@ -58,7 +62,7 @@ pytest
 - [x] Day 4, Multiple workers, concurrency, 2026-11-05
 - [x] Day 5, Job progress and cancellation, 2026-11-06
 - [x] Day 6, Dead letter inspection and requeue endpoint, 2026-11-07
-- [ ] Day 7, Persistence recovery on restart
+- [x] Day 7, Persistence recovery on restart, 2026-11-10
 - [ ] Day 8, Rate limiting per handler
 - [ ] Day 9, Job timeouts
 - [ ] Day 10, Dashboard stats endpoint
@@ -108,3 +112,11 @@ pytest
   job keeps its handler, payload, priority, and idempotency key, but its
   attempts, error, result, and progress are cleared and run_at is set to now,
   so it runs again promptly with a fresh attempt budget.
+- Recovery runs on every startup because only the claim marks a job running,
+  and only the worker clears that mark, so a job still running at startup
+  means its worker died. The crashed attempt counts toward max attempts, so
+  a job that kills its worker every time is dead lettered instead of looping
+  forever. A recovered job is reset to pending with its claim and progress
+  cleared, and a pending cancel request is kept, so the job still ends as
+  cancelled when it runs again. The last recovery summary is kept on the
+  queue and served by `GET /recovery`, so a restart is visible, not silent.

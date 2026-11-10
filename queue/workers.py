@@ -65,6 +65,12 @@ def main(argv=None):
     args = list(sys.argv[1:] if argv is None else argv)
     count = int(args[0]) if args else 4
     queue = JobQueue()
+    recovered = queue.last_recovery
+    if recovered["recovered"] or recovered["dead"]:
+        print(
+            f"Recovered {recovered['recovered']} crashed jobs, "
+            f"{recovered['dead']} dead lettered on startup"
+        )
     workers = run_workers(queue, count)
     print(f"Started {count} workers, press Ctrl+C to stop")
     try:

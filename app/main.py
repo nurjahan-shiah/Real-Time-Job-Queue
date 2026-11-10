@@ -1,4 +1,4 @@
-"""HTTP API around the job queue, including delayed jobs, priority, progress, cancellation, and dead letter requeue."""
+"""HTTP API around the job queue, including delayed jobs, priority, progress, cancellation, dead letter requeue, and restart recovery."""
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
@@ -64,6 +64,11 @@ def list_jobs():
 @app.get("/stats")
 def stats():
     return jobs.stats()
+
+
+@app.get("/recovery")
+def recovery():
+    return jobs.last_recovery
 
 
 @app.post("/process-next")

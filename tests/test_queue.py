@@ -351,3 +351,104 @@ def test_cancel_endpoint():
         assert main.get_job(job["id"])["status"] == "cancelled"
     finally:
         main.jobs = old_jobs
+
+
+def crash_job(q, job_id, attempts=0, progress=0.0):
+    """Fake a worker crash: mark the job running as if it was claimed and the process died."""
+    import sqlite3
+
+    conn = sqlite3.connect(q.db_path, timeout=30.0)
+    conn.execute(
+        "UPDATE jobs SET status = 'running', attempts = ?, claimed_by = 'worker-1', "
+        "progress = ?, progress_message = 'halfway' WHERE id = ?",
+        (attempts, progress, job_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_restart_recovers_crashed_job_to_pending():
+    q = fresh_queue()
+    job = q.enqueue("echo", {"message": "hi"})
+    crash_job(q, job["id"], attempts=0, progress=50)
+    q2 = JobQueue(db_path=q.db_path)
+    recovered = q2.get(job["id"])
+    assert recovered["status"] == "pending"
+    assert recovered["attempts"] == 1
+    assert recovered["claimed_by"] is None
+    assert recovered["progress"] == 0
+    assert recovered["progress_message"] is None
+    assert q2.last_recovery == {"recovered": 1, "dead": 0, "job_ids": [job["id"]]}
+    q3 = JobQueue(db_path=q.db_path)
+    assert q3.last_recovery == {"recovered": 0, "dead": 0, "job_ids": []}
+
+
+def test_recovered_job_runs_to_completion():
+    q = fresh_queue()
+    job = q.enqueue("sum", {"numbers": [2, 3]})
+    crash_job(q, job["id"])
+    q2 = JobQueue(db_path=q.db_path)
+    done = q2.process_next()
+    assert done["id"] == job["id"]
+    assert done["status"] == "completed"
+    assert '"total": 5' in done["result"]
+    assert done["attempts"] == 2
+
+
+def test_restart_dead_letters_job_out_of_attempts():
+    q = fresh_queue()
+    job = q.enqueue("echo", {"message": "hi"}, max_attempts=2)
+    crash_job(q, job["id"], attempts=1)
+    q2 = JobQueue(db_path=q.db_path)
+    dead = q2.get(job["id"])
+    assert dead["status"] == "dead"
+    assert dead["attempts"] == 2
+    assert "worker died" in dead["error"]
+    assert q2.last_recovery == {"recovered": 0, "dead": 1, "job_ids": [job["id"]]}
+    assert q2.list_dead()[0]["id"] == job["id"]
+
+
+def test_recovery_leaves_other_jobs_alone():
+    q = fresh_queue()
+    done_job = q.enqueue("echo", {"message": "done"})
+    pending = q.enqueue("echo", {"message": "pending"})
+    q.process_next()
+    dead_job = q.enqueue("nope", {}, max_attempts=1, run_at=1)
+    q.process_next()
+    cancelled = q.enqueue("echo", {"message": "cancel"})
+    q.cancel(cancelled["id"])
+    crashed = q.enqueue("echo", {"message": "crashed"})
+    crash_job(q, crashed["id"])
+    q2 = JobQueue(db_path=q.db_path)
+    assert q2.get(pending["id"])["status"] == "pending"
+    assert q2.get(pending["id"])["attempts"] == 0
+    assert q2.get(done_job["id"])["status"] == "completed"
+    assert q2.get(dead_job["id"])["status"] == "dead"
+    assert q2.get(cancelled["id"])["status"] == "cancelled"
+    assert q2.get(crashed["id"])["status"] == "pending"
+    assert q2.last_recovery["recovered"] == 1
+    assert q2.last_recovery["dead"] == 0
+
+
+def test_no_orphans_means_empty_recovery():
+    q = fresh_queue()
+    q.enqueue("echo", {"message": "hi"})
+    assert q.last_recovery == {"recovered": 0, "dead": 0, "job_ids": []}
+
+
+def test_recovery_endpoint():
+    import app.main as main
+
+    q = fresh_queue()
+    old_jobs = main.jobs
+    main.jobs = q
+    try:
+        job = q.enqueue("echo", {"message": "hi"})
+        crash_job(q, job["id"])
+        q2 = JobQueue(db_path=q.db_path)
+        main.jobs = q2
+        summary = main.recovery()
+        assert summary["recovered"] == 1
+        assert summary["job_ids"] == [job["id"]]
+    finally:
+        main.jobs = old_jobs

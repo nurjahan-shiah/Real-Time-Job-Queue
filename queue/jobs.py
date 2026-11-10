@@ -1,4 +1,4 @@
-"""SQLite backed job queue with retry, dead letter, idempotency, delayed jobs, priority, multiple workers, progress, cancellation, dead letter inspection, and requeue."""
+"""SQLite backed job queue with retry, dead letter, idempotency, delayed jobs, priority, multiple workers, progress, cancellation, dead letter inspection, requeue, and restart recovery."""
 import inspect
 import sqlite3
 import time
@@ -112,6 +112,57 @@ class JobQueue:
             conn.execute("ALTER TABLE jobs ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0")
         conn.commit()
         conn.close()
+        self.last_recovery = self.recover_orphans()
+
+    def recover_orphans(self):
+        """Recover jobs left running by a worker that died, on startup.
+
+        A job is only ever marked running by the atomic claim, and the worker
+        marks it completed, pending, dead, or cancelled when the handler
+        returns. So a job still marked running when a new JobQueue opens means
+        its worker died mid run, the process crashed or was killed, and the
+        job would otherwise sit in running forever, because only pending jobs
+        are claimed. Recovery runs on every startup, so a restart picks the
+        job up again instead of losing it.
+
+        The crashed attempt counts, attempts goes up by one, so a job that
+        crashes its worker every time still reaches its max attempts and is
+        dead lettered instead of looping forever. A recovered job goes back
+        to pending with its claim and progress cleared, so it runs again
+        promptly. A job already out of attempts is dead lettered with an
+        error saying the worker died while it was running. A cancel request
+        is kept, so a job the user asked to cancel still ends as cancelled
+        when it runs again.
+        """
+        conn = self._conn()
+        rows = conn.execute(
+            "SELECT * FROM jobs WHERE status = 'running'"
+        ).fetchall()
+        recovered = []
+        dead = []
+        for row in rows:
+            job = dict(row)
+            attempts = job["attempts"] + 1
+            if attempts >= job["max_attempts"]:
+                conn.execute(
+                    "UPDATE jobs SET status = 'dead', error = ?, attempts = ?, "
+                    "claimed_by = NULL WHERE id = ?",
+                    ("worker died while job was running, recovered on restart",
+                     attempts, job["id"]),
+                )
+                dead.append(job["id"])
+            else:
+                conn.execute(
+                    "UPDATE jobs SET status = 'pending', attempts = ?, "
+                    "claimed_by = NULL, progress = 0, progress_message = NULL "
+                    "WHERE id = ?",
+                    (attempts, job["id"]),
+                )
+                recovered.append(job["id"])
+        conn.commit()
+        conn.close()
+        return {"recovered": len(recovered), "dead": len(dead),
+                "job_ids": recovered + dead}
 
     def _conn(self):
         conn = sqlite3.connect(self.db_path, timeout=30.0)
