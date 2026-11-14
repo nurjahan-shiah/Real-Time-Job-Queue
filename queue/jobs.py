@@ -1,4 +1,4 @@
-"""SQLite backed job queue with retry, dead letter, idempotency, delayed jobs, priority, multiple workers, progress, cancellation, dead letter inspection, requeue, and restart recovery."""
+"""SQLite backed job queue with retry, dead letter, idempotency, delayed jobs, priority, multiple workers, progress, cancellation, dead letter inspection, requeue, restart recovery, and per handler rate limiting."""
 import inspect
 import sqlite3
 import time
@@ -96,6 +96,17 @@ class JobQueue:
             "priority INTEGER NOT NULL DEFAULT 0, claimed_by TEXT, "
             "progress REAL NOT NULL DEFAULT 0, progress_message TEXT, "
             "cancel_requested INTEGER NOT NULL DEFAULT 0)"
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS rate_limits ("
+            "handler TEXT PRIMARY KEY, "
+            "max_per_window INTEGER NOT NULL, "
+            "window_seconds REAL NOT NULL)"
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS rate_limit_runs ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "handler TEXT NOT NULL, started_at REAL NOT NULL)"
         )
         columns = [r[1] for r in conn.execute("PRAGMA table_info(jobs)")]
         if "run_at" not in columns:
@@ -310,17 +321,171 @@ class JobQueue:
         conn.close()
         return self.get(job_id)
 
+    def set_rate_limit(self, handler_name, max_per_window, window_seconds):
+        """Cap how often one handler runs, at most max_per_window starts in any rolling window of window_seconds.
+
+        The limit lives in SQLite, so it survives a restart, and the runs
+        counted against it are stored too, so a restart does not reset the
+        budget. A limit below 1 or a window that is not positive makes no
+        sense, so both are rejected.
+        """
+        if max_per_window < 1:
+            raise ValueError("max_per_window must be at least 1")
+        if window_seconds <= 0:
+            raise ValueError("window_seconds must be positive")
+        conn = self._conn()
+        conn.execute(
+            "INSERT INTO rate_limits (handler, max_per_window, window_seconds) "
+            "VALUES (?, ?, ?) "
+            "ON CONFLICT(handler) DO UPDATE SET max_per_window = excluded.max_per_window, "
+            "window_seconds = excluded.window_seconds",
+            (handler_name, max_per_window, window_seconds),
+        )
+        conn.commit()
+        conn.close()
+        return self.get_rate_limit(handler_name)
+
+    def get_rate_limit(self, handler_name):
+        conn = self._conn()
+        row = conn.execute(
+            "SELECT * FROM rate_limits WHERE handler = ?", (handler_name,)
+        ).fetchone()
+        conn.close()
+        return dict(row) if row else None
+
+    def list_rate_limits(self):
+        conn = self._conn()
+        rows = conn.execute(
+            "SELECT * FROM rate_limits ORDER BY handler"
+        ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+
+    def clear_rate_limit(self, handler_name):
+        """Remove a handler's limit, and drop its recorded runs."""
+        conn = self._conn()
+        conn.execute(
+            "DELETE FROM rate_limits WHERE handler = ?", (handler_name,)
+        )
+        conn.execute(
+            "DELETE FROM rate_limit_runs WHERE handler = ?", (handler_name,)
+        )
+        conn.commit()
+        conn.close()
+
+    def rate_limit_status(self, handler_name, now=None):
+        """How much of a handler's rate budget is used, or None when it has no limit.
+
+        used counts starts in the current rolling window, remaining is what
+        is left, and reset_in is seconds until the oldest start in the window
+        ages out, or 0 when nothing is running against the limit.
+        """
+        if now is None:
+            now = time.time()
+        limit = self.get_rate_limit(handler_name)
+        if limit is None:
+            return None
+        conn = self._conn()
+        window_start = now - limit["window_seconds"]
+        rows = conn.execute(
+            "SELECT started_at FROM rate_limit_runs "
+            "WHERE handler = ? AND started_at > ? ORDER BY started_at",
+            (handler_name, window_start),
+        ).fetchall()
+        conn.close()
+        used = len(rows)
+        reset_in = 0.0
+        if rows:
+            reset_in = max(
+                0.0, rows[0]["started_at"] + limit["window_seconds"] - now
+            )
+        return {
+            "handler": handler_name,
+            "max_per_window": limit["max_per_window"],
+            "window_seconds": limit["window_seconds"],
+            "used": used,
+            "remaining": max(0, limit["max_per_window"] - used),
+            "reset_in": reset_in,
+        }
+
+    def _claim_next(self, now, worker_id):
+        """Claim the highest priority due job whose handler still has rate budget.
+
+        A job whose handler is at its limit is skipped, not claimed, so other
+        handlers keep running and the limited job waits for its window to
+        slide. The limit check, the claim, and the recording of the run happen
+        in one immediate transaction, so two workers racing for the last unit
+        of budget cannot both win it. A handler with no limit configured is
+        never checked, so unconfigured handlers run exactly as before.
+        """
+        conn = self._conn()
+        conn.isolation_level = None
+        try:
+            candidates = conn.execute(
+                "SELECT id, handler FROM jobs "
+                "WHERE status = 'pending' AND run_at <= ? "
+                "ORDER BY priority DESC, run_at ASC, id ASC",
+                (now,),
+            ).fetchall()
+            for candidate in candidates:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    limit = conn.execute(
+                        "SELECT * FROM rate_limits WHERE handler = ?",
+                        (candidate["handler"],),
+                    ).fetchone()
+                    if limit is not None:
+                        window_start = now - limit["window_seconds"]
+                        conn.execute(
+                            "DELETE FROM rate_limit_runs "
+                            "WHERE handler = ? AND started_at <= ?",
+                            (candidate["handler"], window_start),
+                        )
+                        used = conn.execute(
+                            "SELECT COUNT(*) AS n FROM rate_limit_runs "
+                            "WHERE handler = ? AND started_at > ?",
+                            (candidate["handler"], window_start),
+                        ).fetchone()["n"]
+                        if used >= limit["max_per_window"]:
+                            conn.execute("COMMIT")
+                            continue
+                    row = conn.execute(
+                        "UPDATE jobs SET status = 'running', claimed_by = ? "
+                        "WHERE id = ? AND status = 'pending' RETURNING *",
+                        (worker_id, candidate["id"]),
+                    ).fetchone()
+                    if row is None:
+                        conn.execute("ROLLBACK")
+                        continue
+                    if limit is not None:
+                        conn.execute(
+                            "INSERT INTO rate_limit_runs (handler, started_at) "
+                            "VALUES (?, ?)",
+                            (candidate["handler"], now),
+                        )
+                    conn.execute("COMMIT")
+                    return dict(row)
+                except Exception:
+                    if conn.in_transaction:
+                        conn.execute("ROLLBACK")
+                    raise
+            return None
+        finally:
+            conn.close()
+
     def process_next(self, now=None, worker_id=None):
         """Claim one due pending job, run it, retry or dead letter it. Returns the job or None.
 
         A job is due when its run_at time has passed. Future jobs stay pending
         and are skipped, so a delayed job never runs early. Among due jobs,
         higher priority wins first, then earlier run_at, then lower id, so
-        priority never lets a future job jump ahead of a due job.
+        priority never lets a future job jump ahead of a due job. A job whose
+        handler is out of rate budget is skipped, so a limited handler never
+        blocks other handlers, and the skipped job runs once its window slides.
 
-        The claim is one atomic UPDATE, so two workers calling this at the
-        same time can never claim the same job. The worker that claimed a job
-        is recorded in claimed_by, so you can see who ran what.
+        The claim is atomic, so two workers calling this at the same time can
+        never claim the same job. The worker that claimed a job is recorded
+        in claimed_by, so you can see who ran what.
 
         Handlers that accept a second argument get a progress reporter, so
         they can report percent complete and check for cancellation. A job
@@ -331,18 +496,9 @@ class JobQueue:
         if now is None:
             now = time.time()
         worker_id = worker_id or "worker-1"
-        conn = self._conn()
-        row = conn.execute(
-            "UPDATE jobs SET status = 'running', claimed_by = ? WHERE id = ("
-            "SELECT id FROM jobs WHERE status = 'pending' AND run_at <= ? "
-            "ORDER BY priority DESC, run_at ASC, id ASC LIMIT 1) RETURNING *",
-            (worker_id, now),
-        ).fetchone()
-        conn.commit()
-        conn.close()
-        if row is None:
+        job = self._claim_next(now, worker_id)
+        if job is None:
             return None
-        job = dict(row)
         fn = HANDLERS.get(job["handler"])
         progress = ProgressReporter(self, job["id"])
         try:

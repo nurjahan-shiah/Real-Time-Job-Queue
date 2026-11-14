@@ -452,3 +452,165 @@ def test_recovery_endpoint():
         assert summary["job_ids"] == [job["id"]]
     finally:
         main.jobs = old_jobs
+
+
+def test_no_limit_means_unlimited_runs():
+    q = fresh_queue()
+    for _ in range(5):
+        q.enqueue("echo", {"message": "hi"}, run_at=1000)
+    for _ in range(5):
+        done = q.process_next(now=1000)
+        assert done["status"] == "completed"
+    assert q.process_next(now=1000) is None
+
+
+def test_rate_limit_blocks_second_run_in_window():
+    q = fresh_queue()
+    q.set_rate_limit("echo", 1, 60)
+    first = q.enqueue("echo", {"message": "one"}, run_at=1000)
+    second = q.enqueue("echo", {"message": "two"}, run_at=1000)
+    done = q.process_next(now=1000)
+    assert done["id"] == first["id"]
+    assert done["status"] == "completed"
+    assert q.process_next(now=1030) is None
+    assert q.get(second["id"])["status"] == "pending"
+    done = q.process_next(now=1061)
+    assert done["id"] == second["id"]
+    assert done["status"] == "completed"
+
+
+def test_rate_limit_is_per_handler():
+    q = fresh_queue()
+    q.set_rate_limit("echo", 1, 60)
+    echo_job = q.enqueue("echo", {"message": "hi"}, run_at=1000)
+    sum_job = q.enqueue("sum", {"numbers": [1, 2]}, run_at=1000)
+    assert q.process_next(now=1000)["id"] == echo_job["id"]
+    done = q.process_next(now=1000)
+    assert done["id"] == sum_job["id"]
+    assert done["status"] == "completed"
+
+
+def test_limited_job_does_not_block_other_handlers():
+    q = fresh_queue()
+    q.set_rate_limit("echo", 1, 60)
+    first = q.enqueue("echo", {"message": "first"}, run_at=1000)
+    q.process_next(now=1000)
+    assert q.get(first["id"])["status"] == "completed"
+    blocked = q.enqueue("echo", {"message": "blocked"}, run_at=1000, priority=10)
+    other = q.enqueue("sum", {"numbers": [1, 2]}, run_at=1000, priority=0)
+    done = q.process_next(now=1000)
+    assert done["id"] == other["id"]
+    assert done["status"] == "completed"
+    assert q.get(blocked["id"])["status"] == "pending"
+
+
+def test_rate_limit_window_slides():
+    q = fresh_queue()
+    q.set_rate_limit("echo", 2, 10)
+    jobs = [q.enqueue("echo", {"message": str(i)}, run_at=1000) for i in range(3)]
+    assert q.process_next(now=1000)["id"] == jobs[0]["id"]
+    assert q.process_next(now=1001)["id"] == jobs[1]["id"]
+    assert q.process_next(now=1002) is None
+    done = q.process_next(now=1010)
+    assert done["id"] == jobs[2]["id"]
+    assert done["status"] == "completed"
+
+
+def test_set_rate_limit_rejects_bad_values():
+    import pytest
+
+    q = fresh_queue()
+    with pytest.raises(ValueError):
+        q.set_rate_limit("echo", 0, 60)
+    with pytest.raises(ValueError):
+        q.set_rate_limit("echo", 1, 0)
+    with pytest.raises(ValueError):
+        q.set_rate_limit("echo", 1, -5)
+    assert q.get_rate_limit("echo") is None
+
+
+def test_rate_limit_status_reports_usage():
+    q = fresh_queue()
+    assert q.rate_limit_status("echo") is None
+    q.set_rate_limit("echo", 2, 60)
+    status = q.rate_limit_status("echo", now=1000)
+    assert status["used"] == 0
+    assert status["remaining"] == 2
+    assert status["reset_in"] == 0
+    q.enqueue("echo", {"message": "hi"}, run_at=1000)
+    q.process_next(now=1000)
+    status = q.rate_limit_status("echo", now=1010)
+    assert status["used"] == 1
+    assert status["remaining"] == 1
+    assert status["reset_in"] == 50
+
+
+def test_clear_rate_limit_frees_the_handler():
+    q = fresh_queue()
+    q.set_rate_limit("echo", 1, 60)
+    first = q.enqueue("echo", {"message": "one"}, run_at=1000)
+    second = q.enqueue("echo", {"message": "two"}, run_at=1000)
+    q.process_next(now=1000)
+    assert q.get(first["id"])["status"] == "completed"
+    assert q.process_next(now=1000) is None
+    q.clear_rate_limit("echo")
+    assert q.get_rate_limit("echo") is None
+    done = q.process_next(now=1000)
+    assert done["id"] == second["id"]
+    assert done["status"] == "completed"
+
+
+def test_rate_limit_survives_restart():
+    q = fresh_queue()
+    q.set_rate_limit("echo", 1, 60)
+    first = q.enqueue("echo", {"message": "one"}, run_at=1000)
+    second = q.enqueue("echo", {"message": "two"}, run_at=1000)
+    q.process_next(now=1000)
+    assert q.get(first["id"])["status"] == "completed"
+    q2 = JobQueue(db_path=q.db_path)
+    assert q2.get_rate_limit("echo") == {
+        "handler": "echo",
+        "max_per_window": 1,
+        "window_seconds": 60,
+    }
+    assert q2.process_next(now=1030) is None
+    assert q2.get(second["id"])["status"] == "pending"
+
+
+def test_rate_limit_endpoints():
+    import pytest
+    from fastapi import HTTPException
+
+    import app.main as main
+
+    q = fresh_queue()
+    old_jobs = main.jobs
+    main.jobs = q
+    try:
+        with pytest.raises(HTTPException):
+            main.get_rate_limit("echo")
+        created = main.set_rate_limit(
+            main.RateLimitRequest(handler="echo", max_per_window=1, window_seconds=60)
+        )
+        assert created["handler"] == "echo"
+        assert created["max_per_window"] == 1
+        assert created["remaining"] == 1
+        limits = main.list_rate_limits()
+        assert len(limits) == 1
+        assert limits[0]["handler"] == "echo"
+        first = main.enqueue(main.EnqueueRequest(handler="echo", payload={"message": "one"}))
+        second = main.enqueue(main.EnqueueRequest(handler="echo", payload={"message": "two"}))
+        done = main.process_next()
+        assert done["id"] == first["id"]
+        assert main.process_next() == {"processed": None}
+        assert main.get_job(second["id"])["status"] == "pending"
+        status = main.get_rate_limit("echo")
+        assert status["used"] == 1
+        assert status["remaining"] == 0
+        assert status["reset_in"] > 0
+        with pytest.raises(HTTPException):
+            main.set_rate_limit(
+                main.RateLimitRequest(handler="echo", max_per_window=0, window_seconds=60)
+            )
+    finally:
+        main.jobs = old_jobs

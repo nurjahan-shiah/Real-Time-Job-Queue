@@ -7,7 +7,7 @@ durability decisions recorded along the way, so you can talk about them in an
 interview.
 
 **Status:** In progress, one feature per day, pushed daily.
-Day 7 is done, 2026-11-10. The project is finished when every item below is checked off.
+Day 8 is done, 2026-11-11. The project is finished when every item below is checked off.
 
 ## What it does so far
 - `POST /jobs`, enqueue a job with a handler name, a payload, and an optional
@@ -40,6 +40,11 @@ Day 7 is done, 2026-11-10. The project is finished when every item below is chec
   with attempts left goes back to pending with a fresh claim, a job out of
   attempts is dead lettered, so a restart never loses work or leaves a job
   stuck in running. `GET /recovery` shows what the last startup recovered
+- `POST /rate-limits` caps one handler, at most N starts in a rolling window
+  of W seconds, so a handler that calls a flaky third party never hammers
+  it. A job whose handler is out of budget waits in pending while other
+  handlers keep running, and `GET /rate-limits` shows used, remaining, and
+  seconds until the budget resets
 
 ## Stack
 Python, FastAPI, SQLite for job persistence.
@@ -63,7 +68,7 @@ pytest
 - [x] Day 5, Job progress and cancellation, 2026-11-06
 - [x] Day 6, Dead letter inspection and requeue endpoint, 2026-11-07
 - [x] Day 7, Persistence recovery on restart, 2026-11-10
-- [ ] Day 8, Rate limiting per handler
+- [x] Day 8, Rate limiting per handler, 2026-11-11
 - [ ] Day 9, Job timeouts
 - [ ] Day 10, Dashboard stats endpoint
 - [ ] Day 11, Batch enqueue
@@ -120,3 +125,11 @@ pytest
   cleared, and a pending cancel request is kept, so the job still ends as
   cancelled when it runs again. The last recovery summary is kept on the
   queue and served by `GET /recovery`, so a restart is visible, not silent.
+- Rate limiting is a sliding window counted in SQLite, not in memory, so the
+  budget survives a restart. Each claim records one run row with its start
+  time, and a job is only claimed when fewer than N runs of its handler
+  started inside the window. The check, the claim, and the run row happen in
+  one immediate transaction, so two workers racing for the last unit of
+  budget cannot both win it. A limited job is skipped, not claimed, so it
+  never blocks other handlers, and old run rows are pruned when the window
+  is checked, so the table stays small.

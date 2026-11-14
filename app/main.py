@@ -1,4 +1,4 @@
-"""HTTP API around the job queue, including delayed jobs, priority, progress, cancellation, dead letter requeue, and restart recovery."""
+"""HTTP API around the job queue, including delayed jobs, priority, progress, cancellation, dead letter requeue, restart recovery, and per handler rate limiting."""
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
@@ -64,6 +64,37 @@ def list_jobs():
 @app.get("/stats")
 def stats():
     return jobs.stats()
+
+
+class RateLimitRequest(BaseModel):
+    handler: str
+    max_per_window: int
+    window_seconds: float
+
+
+@app.post("/rate-limits")
+def set_rate_limit(req: RateLimitRequest):
+    try:
+        jobs.set_rate_limit(req.handler, req.max_per_window, req.window_seconds)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return jobs.rate_limit_status(req.handler)
+
+
+@app.get("/rate-limits")
+def list_rate_limits():
+    return [
+        jobs.rate_limit_status(limit["handler"])
+        for limit in jobs.list_rate_limits()
+    ]
+
+
+@app.get("/rate-limits/{handler}")
+def get_rate_limit(handler: str):
+    status = jobs.rate_limit_status(handler)
+    if status is None:
+        raise HTTPException(status_code=404, detail="No rate limit for this handler")
+    return status
 
 
 @app.get("/recovery")
