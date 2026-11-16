@@ -614,3 +614,104 @@ def test_rate_limit_endpoints():
             )
     finally:
         main.jobs = old_jobs
+
+
+def test_timeout_seconds_stored_on_enqueue():
+    q = fresh_queue()
+    job = q.enqueue("echo", {"message": "hi"}, timeout_seconds=5)
+    assert job["timeout_seconds"] == 5
+    plain = q.enqueue("echo", {"message": "hi"})
+    assert plain["timeout_seconds"] is None
+
+
+def test_enqueue_rejects_bad_timeout():
+    import pytest
+
+    q = fresh_queue()
+    with pytest.raises(ValueError):
+        q.enqueue("echo", {"message": "hi"}, timeout_seconds=0)
+    with pytest.raises(ValueError):
+        q.enqueue("echo", {"message": "hi"}, timeout_seconds=-1)
+    assert q.list_jobs() == []
+
+
+def test_job_completes_within_timeout():
+    q = fresh_queue()
+    job = q.enqueue("slow", {"seconds": 0.05}, timeout_seconds=5)
+    done = q.process_next()
+    assert done["id"] == job["id"]
+    assert done["status"] == "completed"
+    assert done["attempts"] == 1
+
+
+def test_slow_job_times_out_then_retries():
+    q = fresh_queue()
+    job = q.enqueue("hang", {"seconds": 0.5}, timeout_seconds=0.1, max_attempts=2)
+    done = q.process_next()
+    assert done["status"] == "pending"
+    assert done["attempts"] == 1
+    assert "timed out after 0.1 seconds" in done["error"]
+    done = q.process_next()
+    assert done["status"] == "dead"
+    assert done["attempts"] == 2
+    assert "timed out" in done["error"]
+
+
+def test_timeout_dead_letters_at_max_attempts():
+    q = fresh_queue()
+    job = q.enqueue("hang", {"seconds": 0.5}, timeout_seconds=0.1, max_attempts=1)
+    done = q.process_next()
+    assert done["status"] == "dead"
+    assert done["attempts"] == 1
+    assert "timed out after 0.1 seconds" in done["error"]
+    assert q.list_dead()[0]["id"] == job["id"]
+
+
+def test_job_without_timeout_waits_for_slow_handler():
+    q = fresh_queue()
+    job = q.enqueue("slow", {"seconds": 0.3})
+    done = q.process_next()
+    assert done["status"] == "completed"
+    assert '"slept": 0.3' in done["result"]
+
+
+def test_requeued_timed_out_job_keeps_its_timeout():
+    q = fresh_queue()
+    job = q.enqueue("hang", {"seconds": 0.5}, timeout_seconds=0.1, max_attempts=1)
+    q.process_next()
+    assert q.get(job["id"])["status"] == "dead"
+    again = q.requeue(job["id"])
+    assert again["status"] == "pending"
+    assert again["timeout_seconds"] == 0.1
+    assert again["attempts"] == 0
+    done = q.process_next()
+    assert done["status"] == "dead"
+    assert "timed out" in done["error"]
+
+
+def test_timeout_endpoint():
+    import pytest
+    from fastapi import HTTPException
+
+    import app.main as main
+
+    q = fresh_queue()
+    old_jobs = main.jobs
+    main.jobs = q
+    try:
+        job = main.enqueue(
+            main.EnqueueRequest(
+                handler="hang", payload={"seconds": 0.5},
+                timeout_seconds=0.1, max_attempts=1,
+            )
+        )
+        assert job["timeout_seconds"] == 0.1
+        done = main.process_next()
+        assert done["status"] == "dead"
+        assert "timed out" in done["error"]
+        with pytest.raises(HTTPException):
+            main.enqueue(
+                main.EnqueueRequest(handler="echo", payload={}, timeout_seconds=0)
+            )
+    finally:
+        main.jobs = old_jobs

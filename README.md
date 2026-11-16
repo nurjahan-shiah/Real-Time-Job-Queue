@@ -7,7 +7,7 @@ durability decisions recorded along the way, so you can talk about them in an
 interview.
 
 **Status:** In progress, one feature per day, pushed daily.
-Day 8 is done, 2026-11-11. The project is finished when every item below is checked off.
+Day 9 is done, 2026-11-15. The project is finished when every item below is checked off.
 
 ## What it does so far
 - `POST /jobs`, enqueue a job with a handler name, a payload, and an optional
@@ -45,6 +45,9 @@ Day 8 is done, 2026-11-11. The project is finished when every item below is chec
   it. A job whose handler is out of budget waits in pending while other
   handlers keep running, and `GET /rate-limits` shows used, remaining, and
   seconds until the budget resets
+- `POST /jobs` accepts timeout_seconds, and a job whose handler runs longer
+  than that is failed with a timed out error, then retried or dead lettered
+  like any other failure, so a stuck handler can never block the queue
 
 ## Stack
 Python, FastAPI, SQLite for job persistence.
@@ -69,7 +72,7 @@ pytest
 - [x] Day 6, Dead letter inspection and requeue endpoint, 2026-11-07
 - [x] Day 7, Persistence recovery on restart, 2026-11-10
 - [x] Day 8, Rate limiting per handler, 2026-11-11
-- [ ] Day 9, Job timeouts
+- [x] Day 9, Job timeouts, 2026-11-15
 - [ ] Day 10, Dashboard stats endpoint
 - [ ] Day 11, Batch enqueue
 - [ ] Day 12, Backoff strategies, exponential backoff
@@ -133,3 +136,14 @@ pytest
   budget cannot both win it. A limited job is skipped, not claimed, so it
   never blocks other handlers, and old run rows are pruned when the window
   is checked, so the table stays small.
+- A timeout is a per job seconds limit stored on the job row, so it survives
+  a restart like every other job setting. The worker runs each handler in a
+  daemon thread and waits at most the timeout for it, so a handler that hangs
+  is failed with a timed out error and retried or dead lettered by the same
+  rules as any other failure, and a job with no timeout waits as long as its
+  handler takes. Python cannot kill a thread, so a timed out handler keeps
+  running in the background until it finishes, but the worker has already
+  moved on, so a stuck handler can never block the queue or another worker.
+  The timeout counts per attempt, so a retried job gets the full budget
+  again, and a requeued job keeps its timeout, so the same limit applies
+  when it runs again.

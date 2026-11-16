@@ -1,4 +1,4 @@
-"""SQLite backed job queue with retry, dead letter, idempotency, delayed jobs, priority, multiple workers, progress, cancellation, dead letter inspection, requeue, restart recovery, and per handler rate limiting."""
+"""SQLite backed job queue with retry, dead letter, idempotency, delayed jobs, priority, multiple workers, progress, cancellation, dead letter inspection, requeue, restart recovery, per handler rate limiting, and job timeouts."""
 import inspect
 import sqlite3
 import time
@@ -35,6 +35,14 @@ def fail_once_handler(payload):
 @handler("slow")
 def slow_handler(payload):
     seconds = payload.get("seconds", 0.2)
+    time.sleep(seconds)
+    return {"slept": seconds}
+
+
+@handler("hang")
+def hang_handler(payload):
+    """Sleep far longer than any test timeout, so timeout tests have a stuck handler to stop waiting for."""
+    seconds = payload.get("seconds", 5)
     time.sleep(seconds)
     return {"slept": seconds}
 
@@ -95,7 +103,8 @@ class JobQueue:
             "created_at REAL NOT NULL, run_at REAL NOT NULL DEFAULT 0, "
             "priority INTEGER NOT NULL DEFAULT 0, claimed_by TEXT, "
             "progress REAL NOT NULL DEFAULT 0, progress_message TEXT, "
-            "cancel_requested INTEGER NOT NULL DEFAULT 0)"
+            "cancel_requested INTEGER NOT NULL DEFAULT 0, "
+            "timeout_seconds REAL)"
         )
         conn.execute(
             "CREATE TABLE IF NOT EXISTS rate_limits ("
@@ -121,6 +130,8 @@ class JobQueue:
             conn.execute("ALTER TABLE jobs ADD COLUMN progress_message TEXT")
         if "cancel_requested" not in columns:
             conn.execute("ALTER TABLE jobs ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0")
+        if "timeout_seconds" not in columns:
+            conn.execute("ALTER TABLE jobs ADD COLUMN timeout_seconds REAL")
         conn.commit()
         conn.close()
         self.last_recovery = self.recover_orphans()
@@ -183,9 +194,11 @@ class JobQueue:
         return conn
 
     def enqueue(self, handler_name, payload, max_attempts=3, idempotency_key=None,
-                run_at=None, delay_seconds=None, priority=0):
+                run_at=None, delay_seconds=None, priority=0, timeout_seconds=None):
         import json
 
+        if timeout_seconds is not None and timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be positive")
         conn = self._conn()
         if idempotency_key:
             row = conn.execute(
@@ -203,10 +216,10 @@ class JobQueue:
         else:
             effective_run_at = now
         cur = conn.execute(
-            "INSERT INTO jobs (handler, payload, max_attempts, idempotency_key, created_at, run_at, priority)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO jobs (handler, payload, max_attempts, idempotency_key, created_at, run_at, priority, timeout_seconds)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (handler_name, json.dumps(payload), max_attempts, idempotency_key, now,
-             effective_run_at, priority),
+             effective_run_at, priority, timeout_seconds),
         )
         job_id = cur.lastrowid
         conn.commit()
@@ -473,6 +486,43 @@ class JobQueue:
         finally:
             conn.close()
 
+    def _run_with_timeout(self, job, fn, progress):
+        """Run one handler call, enforcing the job timeout.
+
+        The handler runs in a daemon thread, and the worker waits at most
+        timeout_seconds for it. Python cannot kill a thread, so a handler
+        that ignores its timeout keeps running in the background until it
+        finishes, but the worker does not wait for it: the attempt is
+        already failed with a timed out error, so a stuck handler can never
+        block the worker or the queue. A job with no timeout waits as long
+        as the handler takes, exactly as before. The timeout counts per
+        attempt, so a retried job gets the full budget again.
+        """
+        import json
+        import threading
+
+        holder = {}
+
+        def target():
+            try:
+                if len(inspect.signature(fn).parameters) >= 2:
+                    holder["result"] = fn(json.loads(job["payload"]), progress)
+                else:
+                    holder["result"] = fn(json.loads(job["payload"]))
+            except Exception as exc:  # noqa: BLE001
+                holder["error"] = exc
+
+        thread = threading.Thread(target=target, daemon=True)
+        thread.start()
+        thread.join(job.get("timeout_seconds"))
+        if thread.is_alive():
+            raise TimeoutError(
+                f"job timed out after {job['timeout_seconds']} seconds"
+            )
+        if "error" in holder:
+            raise holder["error"]
+        return holder.get("result")
+
     def process_next(self, now=None, worker_id=None):
         """Claim one due pending job, run it, retry or dead letter it. Returns the job or None.
 
@@ -490,6 +540,11 @@ class JobQueue:
         Handlers that accept a second argument get a progress reporter, so
         they can report percent complete and check for cancellation. A job
         cancelled while running ends as cancelled, not completed.
+
+        A job with a timeout is failed when its handler runs longer than
+        timeout_seconds, with a timed out error, and is then retried or dead
+        lettered like any other failure. A job with no timeout waits as long
+        as its handler takes.
         """
         import json
 
@@ -504,10 +559,7 @@ class JobQueue:
         try:
             if fn is None:
                 raise RuntimeError(f"unknown handler: {job['handler']}")
-            if len(inspect.signature(fn).parameters) >= 2:
-                result = fn(json.loads(job["payload"]), progress)
-            else:
-                result = fn(json.loads(job["payload"]))
+            result = self._run_with_timeout(job, fn, progress)
             conn = self._conn()
             if self.is_cancel_requested(job["id"]):
                 conn.execute(

@@ -1,4 +1,4 @@
-"""HTTP API around the job queue, including delayed jobs, priority, progress, cancellation, dead letter requeue, restart recovery, and per handler rate limiting."""
+"""HTTP API around the job queue, including delayed jobs, priority, progress, cancellation, dead letter requeue, restart recovery, per handler rate limiting, and job timeouts."""
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
@@ -16,15 +16,19 @@ class EnqueueRequest(BaseModel):
     run_at: float | None = None
     delay_seconds: float | None = None
     priority: int = 0
+    timeout_seconds: float | None = None
 
 
 @app.post("/jobs")
 def enqueue(req: EnqueueRequest):
-    return jobs.enqueue(
-        req.handler, req.payload, req.max_attempts, req.idempotency_key,
-        run_at=req.run_at, delay_seconds=req.delay_seconds,
-        priority=req.priority,
-    )
+    try:
+        return jobs.enqueue(
+            req.handler, req.payload, req.max_attempts, req.idempotency_key,
+            run_at=req.run_at, delay_seconds=req.delay_seconds,
+            priority=req.priority, timeout_seconds=req.timeout_seconds,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @app.get("/jobs/{job_id}")
