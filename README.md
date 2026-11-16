@@ -7,7 +7,7 @@ durability decisions recorded along the way, so you can talk about them in an
 interview.
 
 **Status:** In progress, one feature per day, pushed daily.
-Day 9 is done, 2026-11-15. The project is finished when every item below is checked off.
+Day 10 is done, 2026-11-16. The project is finished when every item below is checked off.
 
 ## What it does so far
 - `POST /jobs`, enqueue a job with a handler name, a payload, and an optional
@@ -48,6 +48,12 @@ Day 9 is done, 2026-11-15. The project is finished when every item below is chec
 - `POST /jobs` accepts timeout_seconds, and a job whose handler runs longer
   than that is failed with a timed out error, then retried or dead lettered
   like any other failure, so a stuck handler can never block the queue
+- `GET /dashboard` returns one summary for a dashboard, counts by status
+  and by handler, backlog split into due now and scheduled for later with
+  the age of the oldest pending job, throughput for the last minute and the
+  last hour, the newest dead jobs with their errors, live rate limit
+  budgets, and the last recovery summary, so you can watch the queue
+  without querying each endpoint separately
 
 ## Stack
 Python, FastAPI, SQLite for job persistence.
@@ -73,7 +79,7 @@ pytest
 - [x] Day 7, Persistence recovery on restart, 2026-11-10
 - [x] Day 8, Rate limiting per handler, 2026-11-11
 - [x] Day 9, Job timeouts, 2026-11-15
-- [ ] Day 10, Dashboard stats endpoint
+- [x] Day 10, Dashboard stats endpoint, 2026-11-16
 - [ ] Day 11, Batch enqueue
 - [ ] Day 12, Backoff strategies, exponential backoff
 - [ ] Day 13, Poison job handling, failure stories
@@ -147,3 +153,9 @@ pytest
   The timeout counts per attempt, so a retried job gets the full budget
   again, and a requeued job keeps its timeout, so the same limit applies
   when it runs again.
+- The dashboard reads finished_at, a timestamp set when a job reaches a
+  terminal state, completed, dead, or cancelled, so throughput is a plain
+  count over the last minute and the last hour, and requeue clears it, so
+  a job that runs again is counted only when it finishes again. The
+  endpoint is one read only summary over the jobs table, not a new store,
+  so it can never drift from the data it reports on.

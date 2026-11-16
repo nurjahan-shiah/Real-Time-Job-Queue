@@ -1,4 +1,4 @@
-"""HTTP API around the job queue, including delayed jobs, priority, progress, cancellation, dead letter requeue, restart recovery, per handler rate limiting, and job timeouts."""
+"""HTTP API around the job queue, including delayed jobs, priority, progress, cancellation, dead letter requeue, restart recovery, per handler rate limiting, job timeouts, and dashboard stats."""
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
@@ -68,6 +68,11 @@ def list_jobs():
 @app.get("/stats")
 def stats():
     return jobs.stats()
+
+
+@app.get("/dashboard")
+def dashboard():
+    return jobs.dashboard_stats()
 
 
 class RateLimitRequest(BaseModel):

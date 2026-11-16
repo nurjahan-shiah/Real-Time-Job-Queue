@@ -1,4 +1,4 @@
-"""SQLite backed job queue with retry, dead letter, idempotency, delayed jobs, priority, multiple workers, progress, cancellation, dead letter inspection, requeue, restart recovery, per handler rate limiting, and job timeouts."""
+"""SQLite backed job queue with retry, dead letter, idempotency, delayed jobs, priority, multiple workers, progress, cancellation, dead letter inspection, requeue, restart recovery, per handler rate limiting, job timeouts, and dashboard stats."""
 import inspect
 import sqlite3
 import time
@@ -104,7 +104,7 @@ class JobQueue:
             "priority INTEGER NOT NULL DEFAULT 0, claimed_by TEXT, "
             "progress REAL NOT NULL DEFAULT 0, progress_message TEXT, "
             "cancel_requested INTEGER NOT NULL DEFAULT 0, "
-            "timeout_seconds REAL)"
+            "timeout_seconds REAL, finished_at REAL)"
         )
         conn.execute(
             "CREATE TABLE IF NOT EXISTS rate_limits ("
@@ -132,6 +132,8 @@ class JobQueue:
             conn.execute("ALTER TABLE jobs ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0")
         if "timeout_seconds" not in columns:
             conn.execute("ALTER TABLE jobs ADD COLUMN timeout_seconds REAL")
+        if "finished_at" not in columns:
+            conn.execute("ALTER TABLE jobs ADD COLUMN finished_at REAL")
         conn.commit()
         conn.close()
         self.last_recovery = self.recover_orphans()
@@ -157,6 +159,7 @@ class JobQueue:
         when it runs again.
         """
         conn = self._conn()
+        now = time.time()
         rows = conn.execute(
             "SELECT * FROM jobs WHERE status = 'running'"
         ).fetchall()
@@ -168,9 +171,9 @@ class JobQueue:
             if attempts >= job["max_attempts"]:
                 conn.execute(
                     "UPDATE jobs SET status = 'dead', error = ?, attempts = ?, "
-                    "claimed_by = NULL WHERE id = ?",
+                    "claimed_by = NULL, finished_at = ? WHERE id = ?",
                     ("worker died while job was running, recovered on restart",
-                     attempts, job["id"]),
+                     attempts, now, job["id"]),
                 )
                 dead.append(job["id"])
             else:
@@ -249,6 +252,97 @@ class JobQueue:
         conn.close()
         return {r["status"]: r["n"] for r in rows}
 
+    def dashboard_stats(self, now=None):
+        """One summary for a dashboard, counts, backlog, throughput, and recent failures.
+
+        by_status is the same count as stats, by_handler breaks each handler
+        down by status, backlog splits pending jobs into due now and scheduled
+        for later, with the age of the oldest pending job, throughput counts
+        jobs that finished in the last minute and the last hour from
+        finished_at, recent_dead is the newest dead jobs with their errors,
+        rate_limits is the live budget of every capped handler, and recovery
+        is what the last startup recovered. It is a read only summary over
+        the jobs table, so it can never drift from the data it reports on.
+        """
+        if now is None:
+            now = time.time()
+        conn = self._conn()
+        by_status = {
+            r["status"]: r["n"]
+            for r in conn.execute(
+                "SELECT status, COUNT(*) AS n FROM jobs GROUP BY status"
+            ).fetchall()
+        }
+        by_handler = {}
+        for r in conn.execute(
+            "SELECT handler, status, COUNT(*) AS n FROM jobs "
+            "GROUP BY handler, status"
+        ).fetchall():
+            entry = by_handler.setdefault(
+                r["handler"],
+                {"total": 0, "completed": 0, "dead": 0, "pending": 0,
+                 "running": 0, "cancelled": 0},
+            )
+            entry["total"] += r["n"]
+            if r["status"] in entry:
+                entry[r["status"]] = r["n"]
+        due_now = conn.execute(
+            "SELECT COUNT(*) AS n FROM jobs "
+            "WHERE status = 'pending' AND run_at <= ?",
+            (now,),
+        ).fetchone()["n"]
+        scheduled = conn.execute(
+            "SELECT COUNT(*) AS n FROM jobs "
+            "WHERE status = 'pending' AND run_at > ?",
+            (now,),
+        ).fetchone()["n"]
+        oldest = conn.execute(
+            "SELECT MIN(created_at) AS oldest FROM jobs WHERE status = 'pending'"
+        ).fetchone()["oldest"]
+        completed_minute = conn.execute(
+            "SELECT COUNT(*) AS n FROM jobs WHERE status = 'completed' "
+            "AND finished_at IS NOT NULL AND finished_at > ?",
+            (now - 60,),
+        ).fetchone()["n"]
+        completed_hour = conn.execute(
+            "SELECT COUNT(*) AS n FROM jobs WHERE status = 'completed' "
+            "AND finished_at IS NOT NULL AND finished_at > ?",
+            (now - 3600,),
+        ).fetchone()["n"]
+        dead_hour = conn.execute(
+            "SELECT COUNT(*) AS n FROM jobs WHERE status = 'dead' "
+            "AND finished_at IS NOT NULL AND finished_at > ?",
+            (now - 3600,),
+        ).fetchone()["n"]
+        recent_dead = conn.execute(
+            "SELECT id, handler, error, attempts, finished_at FROM jobs "
+            "WHERE status = 'dead' ORDER BY id DESC LIMIT 5"
+        ).fetchall()
+        conn.close()
+        return {
+            "total_jobs": sum(by_status.values()),
+            "by_status": by_status,
+            "by_handler": by_handler,
+            "backlog": {
+                "due_now": due_now,
+                "scheduled_future": scheduled,
+                "oldest_pending_age_seconds": (
+                    round(now - oldest, 3) if oldest is not None else None
+                ),
+            },
+            "throughput": {
+                "completed_last_minute": completed_minute,
+                "completed_last_hour": completed_hour,
+                "dead_last_hour": dead_hour,
+            },
+            "recent_dead": [dict(r) for r in recent_dead],
+            "rate_limits": [
+                self.rate_limit_status(limit["handler"], now=now)
+                for limit in self.list_rate_limits()
+            ],
+            "recovery": self.last_recovery,
+        }
+
     def report_progress(self, job_id, percent, message=None):
         """Store progress, clamped to 0 to 100, on the job row."""
         percent = max(0.0, min(100.0, float(percent)))
@@ -281,8 +375,9 @@ class JobQueue:
         conn = self._conn()
         if job["status"] == "pending":
             conn.execute(
-                "UPDATE jobs SET status = 'cancelled', cancel_requested = 1 WHERE id = ?",
-                (job_id,),
+                "UPDATE jobs SET status = 'cancelled', cancel_requested = 1, "
+                "finished_at = ? WHERE id = ?",
+                (time.time(), job_id),
             )
         else:
             conn.execute(
@@ -327,7 +422,8 @@ class JobQueue:
         conn.execute(
             "UPDATE jobs SET status = 'pending', attempts = 0, error = NULL, "
             "result = NULL, progress = 0, progress_message = NULL, "
-            "cancel_requested = 0, claimed_by = NULL, run_at = ? WHERE id = ?",
+            "cancel_requested = 0, claimed_by = NULL, finished_at = NULL, "
+            "run_at = ? WHERE id = ?",
             (time.time(), job_id),
         )
         conn.commit()
@@ -563,13 +659,13 @@ class JobQueue:
             conn = self._conn()
             if self.is_cancel_requested(job["id"]):
                 conn.execute(
-                    "UPDATE jobs SET status = 'cancelled', result = ?, attempts = attempts + 1 WHERE id = ?",
-                    (json.dumps(result), job["id"]),
+                    "UPDATE jobs SET status = 'cancelled', result = ?, attempts = attempts + 1, finished_at = ? WHERE id = ?",
+                    (json.dumps(result), now, job["id"]),
                 )
             else:
                 conn.execute(
-                    "UPDATE jobs SET status = 'completed', result = ?, attempts = attempts + 1 WHERE id = ?",
-                    (json.dumps(result), job["id"]),
+                    "UPDATE jobs SET status = 'completed', result = ?, attempts = attempts + 1, finished_at = ? WHERE id = ?",
+                    (json.dumps(result), now, job["id"]),
                 )
             conn.commit()
             conn.close()
@@ -578,13 +674,13 @@ class JobQueue:
             attempts = job["attempts"] + 1
             if self.is_cancel_requested(job["id"]):
                 conn.execute(
-                    "UPDATE jobs SET status = 'cancelled', error = ?, attempts = ? WHERE id = ?",
-                    (str(exc), attempts, job["id"]),
+                    "UPDATE jobs SET status = 'cancelled', error = ?, attempts = ?, finished_at = ? WHERE id = ?",
+                    (str(exc), attempts, now, job["id"]),
                 )
             elif attempts >= job["max_attempts"]:
                 conn.execute(
-                    "UPDATE jobs SET status = 'dead', error = ?, attempts = ? WHERE id = ?",
-                    (str(exc), attempts, job["id"]),
+                    "UPDATE jobs SET status = 'dead', error = ?, attempts = ?, finished_at = ? WHERE id = ?",
+                    (str(exc), attempts, now, job["id"]),
                 )
             else:
                 conn.execute(

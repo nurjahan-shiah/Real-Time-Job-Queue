@@ -715,3 +715,119 @@ def test_timeout_endpoint():
             )
     finally:
         main.jobs = old_jobs
+
+
+def test_dashboard_counts_by_status_and_handler():
+    q = fresh_queue()
+    q.enqueue("echo", {"message": "one"})
+    q.enqueue("echo", {"message": "two"})
+    q.enqueue("sum", {"numbers": [1]})
+    q.enqueue("nope", {}, max_attempts=1)
+    for _ in range(4):
+        q.process_next()
+    stats = q.dashboard_stats()
+    assert stats["total_jobs"] == 4
+    assert stats["by_status"]["completed"] == 3
+    assert stats["by_status"]["dead"] == 1
+    assert stats["by_handler"]["echo"] == {
+        "total": 2, "completed": 2, "dead": 0, "pending": 0,
+        "running": 0, "cancelled": 0,
+    }
+    assert stats["by_handler"]["sum"]["completed"] == 1
+    assert stats["by_handler"]["nope"]["dead"] == 1
+
+
+def test_dashboard_on_empty_queue():
+    q = fresh_queue()
+    stats = q.dashboard_stats()
+    assert stats["total_jobs"] == 0
+    assert stats["by_status"] == {}
+    assert stats["by_handler"] == {}
+    assert stats["backlog"] == {
+        "due_now": 0, "scheduled_future": 0, "oldest_pending_age_seconds": None,
+    }
+    assert stats["throughput"] == {
+        "completed_last_minute": 0, "completed_last_hour": 0, "dead_last_hour": 0,
+    }
+    assert stats["recent_dead"] == []
+    assert stats["rate_limits"] == []
+    assert stats["recovery"] == {"recovered": 0, "dead": 0, "job_ids": []}
+
+
+def test_dashboard_backlog_splits_due_and_future():
+    q = fresh_queue()
+    now = time.time()
+    q.enqueue("echo", {"message": "due"}, run_at=now - 10)
+    q.enqueue("echo", {"message": "future"}, run_at=now + 3600)
+    stats = q.dashboard_stats()
+    assert stats["backlog"]["due_now"] == 1
+    assert stats["backlog"]["scheduled_future"] == 1
+    age = stats["backlog"]["oldest_pending_age_seconds"]
+    assert age is not None and 0 <= age < 60
+
+
+def test_dashboard_throughput_counts_recent_completions():
+    q = fresh_queue()
+    q.enqueue("echo", {"message": "one"})
+    q.enqueue("echo", {"message": "two"})
+    q.process_next()
+    q.process_next()
+    stats = q.dashboard_stats()
+    assert stats["throughput"]["completed_last_minute"] == 2
+    assert stats["throughput"]["completed_last_hour"] == 2
+    assert stats["throughput"]["dead_last_hour"] == 0
+
+
+def test_dashboard_recent_dead_lists_failures():
+    q = fresh_queue()
+    job = q.enqueue("nope", {}, max_attempts=1)
+    q.process_next()
+    stats = q.dashboard_stats()
+    assert len(stats["recent_dead"]) == 1
+    assert stats["recent_dead"][0]["id"] == job["id"]
+    assert stats["recent_dead"][0]["handler"] == "nope"
+    assert "unknown handler" in stats["recent_dead"][0]["error"]
+    assert stats["throughput"]["dead_last_hour"] == 1
+
+
+def test_dashboard_includes_rate_limits_and_recovery():
+    q = fresh_queue()
+    q.set_rate_limit("echo", 2, 60)
+    q.enqueue("echo", {"message": "hi"})
+    q.process_next()
+    stats = q.dashboard_stats()
+    assert len(stats["rate_limits"]) == 1
+    assert stats["rate_limits"][0]["handler"] == "echo"
+    assert stats["rate_limits"][0]["used"] == 1
+    assert stats["rate_limits"][0]["remaining"] == 1
+    assert stats["recovery"] == {"recovered": 0, "dead": 0, "job_ids": []}
+
+
+def test_finished_at_set_on_completion_and_cleared_on_requeue():
+    q = fresh_queue()
+    job = q.enqueue("nope", {}, max_attempts=1)
+    assert q.get(job["id"])["finished_at"] is None
+    done = q.process_next()
+    assert done["status"] == "dead"
+    assert done["finished_at"] is not None
+    again = q.requeue(job["id"])
+    assert again["status"] == "pending"
+    assert again["finished_at"] is None
+
+
+def test_dashboard_endpoint():
+    import app.main as main
+
+    q = fresh_queue()
+    old_jobs = main.jobs
+    main.jobs = q
+    try:
+        q.enqueue("echo", {"message": "hi"})
+        q.process_next()
+        stats = main.dashboard()
+        assert stats["total_jobs"] == 1
+        assert stats["by_status"]["completed"] == 1
+        assert stats["throughput"]["completed_last_minute"] == 1
+        assert stats["throughput"]["completed_last_hour"] == 1
+    finally:
+        main.jobs = old_jobs
