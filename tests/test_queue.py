@@ -3,7 +3,7 @@ import threading
 import time
 from pathlib import Path
 
-from queue.jobs import HANDLERS, JobQueue
+from queue.jobs import HANDLERS, MAX_BATCH_SIZE, JobQueue
 from queue.workers import Worker, run_workers
 
 
@@ -829,5 +829,125 @@ def test_dashboard_endpoint():
         assert stats["by_status"]["completed"] == 1
         assert stats["throughput"]["completed_last_minute"] == 1
         assert stats["throughput"]["completed_last_hour"] == 1
+    finally:
+        main.jobs = old_jobs
+
+
+def test_batch_enqueue_creates_all_jobs():
+    q = fresh_queue()
+    created = q.enqueue_many([
+        {"handler": "echo", "payload": {"message": "one"}},
+        {"handler": "sum", "payload": {"numbers": [1, 2, 3]}},
+        {"handler": "echo", "payload": {"message": "three"}},
+    ])
+    assert len(created) == 3
+    assert [job["handler"] for job in created] == ["echo", "sum", "echo"]
+    assert created[0]["id"] < created[1]["id"] < created[2]["id"]
+    assert all(job["status"] == "pending" for job in created)
+    assert '"message": "one"' in created[0]["payload"]
+    assert len(q.list_jobs()) == 3
+
+
+def test_batch_enqueue_empty_list_returns_empty():
+    q = fresh_queue()
+    assert q.enqueue_many([]) == []
+    assert q.list_jobs() == []
+
+
+def test_batch_enqueue_is_atomic_on_bad_spec():
+    import pytest
+
+    q = fresh_queue()
+    with pytest.raises(ValueError):
+        q.enqueue_many([
+            {"handler": "echo", "payload": {"message": "one"}},
+            {"handler": "echo", "payload": {"message": "bad"}, "timeout_seconds": 0},
+            {"handler": "echo", "payload": {"message": "three"}},
+        ])
+    assert q.list_jobs() == []
+
+
+def test_batch_enqueue_missing_handler_fails_whole_batch():
+    import pytest
+
+    q = fresh_queue()
+    with pytest.raises(ValueError):
+        q.enqueue_many([
+            {"handler": "echo", "payload": {"message": "one"}},
+            {"payload": {"message": "no handler"}},
+        ])
+    assert q.list_jobs() == []
+
+
+def test_batch_enqueue_respects_idempotency():
+    q = fresh_queue()
+    existing = q.enqueue("echo", {"message": "first"}, idempotency_key="dup")
+    created = q.enqueue_many([
+        {"handler": "echo", "payload": {"message": "again"}, "idempotency_key": "dup"},
+        {"handler": "echo", "payload": {"message": "new"}, "idempotency_key": "fresh"},
+        {"handler": "echo", "payload": {"message": "new again"}, "idempotency_key": "fresh"},
+    ])
+    assert created[0]["id"] == existing["id"]
+    assert '"message": "first"' in created[0]["payload"]
+    assert created[1]["id"] == created[2]["id"]
+    assert len(q.list_jobs()) == 2
+
+
+def test_batch_enqueue_rejects_oversized_batch():
+    import pytest
+
+    q = fresh_queue()
+    specs = [
+        {"handler": "echo", "payload": {"message": str(i)}}
+        for i in range(MAX_BATCH_SIZE + 1)
+    ]
+    with pytest.raises(ValueError):
+        q.enqueue_many(specs)
+    assert q.list_jobs() == []
+    created = q.enqueue_many(specs[:MAX_BATCH_SIZE])
+    assert len(created) == MAX_BATCH_SIZE
+
+
+def test_batch_enqueue_accepts_per_item_options():
+    q = fresh_queue()
+    now = time.time()
+    created = q.enqueue_many([
+        {"handler": "echo", "payload": {"message": "urgent"}, "priority": 5},
+        {"handler": "echo", "payload": {"message": "later"}, "delay_seconds": 60},
+        {"handler": "slow", "payload": {"seconds": 0.05}, "timeout_seconds": 5},
+    ])
+    assert created[0]["priority"] == 5
+    assert created[1]["run_at"] > now + 30
+    assert created[2]["timeout_seconds"] == 5
+
+
+def test_batch_enqueue_endpoint():
+    import pytest
+    from fastapi import HTTPException
+
+    import app.main as main
+
+    q = fresh_queue()
+    old_jobs = main.jobs
+    main.jobs = q
+    try:
+        created = main.enqueue_batch(
+            main.BatchEnqueueRequest(jobs=[
+                main.EnqueueRequest(handler="echo", payload={"message": "one"}),
+                main.EnqueueRequest(handler="sum", payload={"numbers": [1, 2]}),
+            ])
+        )
+        assert len(created) == 2
+        assert created[0]["handler"] == "echo"
+        assert created[1]["handler"] == "sum"
+        with pytest.raises(HTTPException):
+            main.enqueue_batch(
+                main.BatchEnqueueRequest(jobs=[
+                    main.EnqueueRequest(handler="echo", payload={}),
+                    main.EnqueueRequest(handler="echo", payload={}, timeout_seconds=0),
+                ])
+            )
+        assert len(q.list_jobs()) == 2
+        assert main.enqueue_batch(main.BatchEnqueueRequest(jobs=[])) == []
     finally:
         main.jobs = old_jobs

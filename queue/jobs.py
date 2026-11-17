@@ -1,8 +1,10 @@
-"""SQLite backed job queue with retry, dead letter, idempotency, delayed jobs, priority, multiple workers, progress, cancellation, dead letter inspection, requeue, restart recovery, per handler rate limiting, job timeouts, and dashboard stats."""
+"""SQLite backed job queue with retry, dead letter, idempotency, delayed jobs, priority, multiple workers, progress, cancellation, dead letter inspection, requeue, restart recovery, per handler rate limiting, job timeouts, dashboard stats, and batch enqueue."""
 import inspect
 import sqlite3
 import time
 from pathlib import Path
+
+MAX_BATCH_SIZE = 100
 
 HANDLERS = {}
 
@@ -229,6 +231,85 @@ class JobQueue:
         row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
         conn.close()
         return dict(row)
+
+    def enqueue_many(self, specs):
+        """Enqueue many jobs in one request, in a single transaction.
+
+        specs is a list of dicts, each with the same keys enqueue accepts:
+        handler, payload, max_attempts, idempotency_key, run_at,
+        delay_seconds, priority, timeout_seconds. Every spec is validated
+        before anything is inserted, and the whole batch is committed once,
+        so a bad item fails the batch with no partial enqueue. A spec whose
+        idempotency key already exists returns that existing job instead of
+        a duplicate, exactly like enqueue, and the same key twice in one
+        batch returns the same job twice. A batch over MAX_BATCH_SIZE is
+        rejected, so one request cannot flood the queue. The returned jobs
+        are in the same order as the specs.
+        """
+        import json
+
+        if not isinstance(specs, list):
+            raise ValueError("specs must be a list of job specs")
+        if len(specs) > MAX_BATCH_SIZE:
+            raise ValueError(
+                f"batch too large, at most {MAX_BATCH_SIZE} jobs per batch"
+            )
+        for spec in specs:
+            if not spec.get("handler"):
+                raise ValueError("each job spec needs a handler")
+            timeout = spec.get("timeout_seconds")
+            if timeout is not None and timeout <= 0:
+                raise ValueError("timeout_seconds must be positive")
+        now = time.time()
+        conn = self._conn()
+        conn.isolation_level = None
+        created = []
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            for spec in specs:
+                key = spec.get("idempotency_key")
+                if key:
+                    row = conn.execute(
+                        "SELECT * FROM jobs WHERE idempotency_key = ?",
+                        (key,),
+                    ).fetchone()
+                    if row:
+                        created.append(dict(row))
+                        continue
+                delay = spec.get("delay_seconds")
+                run_at = spec.get("run_at")
+                if delay is not None:
+                    effective_run_at = now + delay
+                elif run_at is not None:
+                    effective_run_at = run_at
+                else:
+                    effective_run_at = now
+                cur = conn.execute(
+                    "INSERT INTO jobs (handler, payload, max_attempts, idempotency_key, created_at, run_at, priority, timeout_seconds)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        spec["handler"],
+                        json.dumps(spec.get("payload", {})),
+                        spec.get("max_attempts", 3),
+                        key,
+                        now,
+                        effective_run_at,
+                        spec.get("priority", 0),
+                        spec.get("timeout_seconds"),
+                    ),
+                )
+                row = conn.execute(
+                    "SELECT * FROM jobs WHERE id = ?", (cur.lastrowid,)
+                ).fetchone()
+                created.append(dict(row))
+            conn.execute("COMMIT")
+        except Exception:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
+        return created
 
     def get(self, job_id):
         conn = self._conn()

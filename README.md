@@ -7,7 +7,7 @@ durability decisions recorded along the way, so you can talk about them in an
 interview.
 
 **Status:** In progress, one feature per day, pushed daily.
-Day 10 is done, 2026-11-16. The project is finished when every item below is checked off.
+Day 11 is done, 2026-11-17. The project is finished when every item below is checked off.
 
 ## What it does so far
 - `POST /jobs`, enqueue a job with a handler name, a payload, and an optional
@@ -54,6 +54,10 @@ Day 10 is done, 2026-11-16. The project is finished when every item below is che
   last hour, the newest dead jobs with their errors, live rate limit
   budgets, and the last recovery summary, so you can watch the queue
   without querying each endpoint separately
+- `POST /jobs/batch` enqueues many jobs in one request, each with its own
+  handler, payload, priority, delay, and timeout, in a single transaction,
+  so a batch is all or nothing and a bad item never leaves a partial batch
+  behind
 
 ## Stack
 Python, FastAPI, SQLite for job persistence.
@@ -80,7 +84,7 @@ pytest
 - [x] Day 8, Rate limiting per handler, 2026-11-11
 - [x] Day 9, Job timeouts, 2026-11-15
 - [x] Day 10, Dashboard stats endpoint, 2026-11-16
-- [ ] Day 11, Batch enqueue
+- [x] Day 11, Batch enqueue, 2026-11-17
 - [ ] Day 12, Backoff strategies, exponential backoff
 - [ ] Day 13, Poison job handling, failure stories
 - [ ] Day 14, Load test, throughput numbers
@@ -159,3 +163,14 @@ pytest
   a job that runs again is counted only when it finishes again. The
   endpoint is one read only summary over the jobs table, not a new store,
   so it can never drift from the data it reports on.
+- A batch is one transaction, not one insert per job, so a client that
+  enqueues a hundred jobs never leaves a partial batch behind when one
+  item is bad. Every spec is validated before anything is inserted, and
+  the whole batch is committed once, so a bad item fails the batch with
+  zero jobs created. Each spec keeps its own handler, payload, priority,
+  delay, and timeout, so a batch is just many single enqueues sharing one
+  request and one commit. Idempotency works per item, so a key that
+  already exists returns that job instead of a duplicate, and the same
+  key twice in one batch returns the same job twice. Batches are capped
+  at 100 jobs, so one request cannot flood the queue or hold the writer
+  lock for long.
