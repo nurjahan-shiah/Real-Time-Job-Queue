@@ -3,7 +3,7 @@ import threading
 import time
 from pathlib import Path
 
-from queue.jobs import HANDLERS, MAX_BATCH_SIZE, JobQueue
+from queue.jobs import BACKOFF_STRATEGIES, HANDLERS, MAX_BATCH_SIZE, JobQueue, compute_backoff
 from queue.workers import Worker, run_workers
 
 
@@ -951,3 +951,147 @@ def test_batch_enqueue_endpoint():
         assert main.enqueue_batch(main.BatchEnqueueRequest(jobs=[])) == []
     finally:
         main.jobs = old_jobs
+
+
+def test_compute_backoff_exponential_doubles_each_attempt():
+    assert compute_backoff("exponential", 1.0, 1, 60.0) == 1.0
+    assert compute_backoff("exponential", 1.0, 2, 60.0) == 2.0
+    assert compute_backoff("exponential", 1.0, 3, 60.0) == 4.0
+    assert compute_backoff("exponential", 1.0, 4, 60.0) == 8.0
+    assert compute_backoff("exponential", 2.0, 3, 60.0) == 8.0
+
+
+def test_compute_backoff_capped_at_cap_seconds():
+    assert compute_backoff("exponential", 10.0, 5, 60.0) == 60.0
+    assert compute_backoff("linear", 10.0, 9, 60.0) == 60.0
+    assert compute_backoff("constant", 100.0, 1, 60.0) == 60.0
+
+
+def test_compute_backoff_linear_constant_and_none():
+    assert compute_backoff("linear", 5.0, 1, 60.0) == 5.0
+    assert compute_backoff("linear", 5.0, 3, 60.0) == 15.0
+    assert compute_backoff("constant", 5.0, 3, 60.0) == 5.0
+    assert compute_backoff("none", 5.0, 3, 60.0) == 0.0
+    assert set(BACKOFF_STRATEGIES) == {"none", "constant", "linear", "exponential"}
+
+
+def test_compute_backoff_rejects_bad_settings():
+    import pytest
+
+    with pytest.raises(ValueError):
+        compute_backoff("random", 1.0, 1, 60.0)
+    with pytest.raises(ValueError):
+        compute_backoff("exponential", 0, 1, 60.0)
+    with pytest.raises(ValueError):
+        compute_backoff("exponential", 1.0, 1, 0)
+    with pytest.raises(ValueError):
+        compute_backoff("exponential", 1.0, 0, 60.0)
+
+
+def test_failed_job_waits_for_exponential_backoff():
+    q = fresh_queue()
+    job = q.enqueue("nope", {}, max_attempts=3, run_at=1000,
+                    backoff_strategy="exponential", backoff_base_seconds=100.0,
+                    backoff_cap_seconds=1000.0)
+    first = q.process_next(now=1000)
+    assert first["status"] == "pending"
+    assert first["attempts"] == 1
+    assert first["run_at"] == 1100.0
+    assert q.process_next(now=1050) is None
+    assert q.get(job["id"])["status"] == "pending"
+    second = q.process_next(now=1100)
+    assert second["status"] == "pending"
+    assert second["attempts"] == 2
+    assert second["run_at"] == 1300.0
+    third = q.process_next(now=1300)
+    assert third["status"] == "dead"
+    assert third["attempts"] == 3
+
+
+def test_linear_backoff_grows_by_base_each_attempt():
+    q = fresh_queue()
+    job = q.enqueue("nope", {}, max_attempts=3, run_at=1000,
+                    backoff_strategy="linear",
+                    backoff_base_seconds=10.0, backoff_cap_seconds=1000.0)
+    first = q.process_next(now=1000)
+    assert first["run_at"] == 1010.0
+    second = q.process_next(now=1010)
+    assert second["run_at"] == 1030.0
+    assert q.get(job["id"])["status"] == "pending"
+
+
+def test_backoff_default_is_none_so_retries_run_at_once():
+    q = fresh_queue()
+    job = q.enqueue("nope", {}, max_attempts=2)
+    q.process_next()
+    assert q.get(job["id"])["status"] == "pending"
+    q.process_next()
+    assert q.get(job["id"])["status"] == "dead"
+
+
+def test_enqueue_rejects_bad_backoff():
+    import pytest
+
+    q = fresh_queue()
+    with pytest.raises(ValueError):
+        q.enqueue("echo", {}, backoff_strategy="random")
+    with pytest.raises(ValueError):
+        q.enqueue("echo", {}, backoff_base_seconds=0)
+    with pytest.raises(ValueError):
+        q.enqueue("echo", {}, backoff_cap_seconds=-1)
+    assert len(q.list_jobs()) == 0
+
+
+def test_backoff_settings_stored_on_job_row():
+    q = fresh_queue()
+    job = q.enqueue("echo", {"message": "hi"}, backoff_strategy="linear",
+                    backoff_base_seconds=2.5, backoff_cap_seconds=30.0)
+    assert job["backoff_strategy"] == "linear"
+    assert job["backoff_base_seconds"] == 2.5
+    assert job["backoff_cap_seconds"] == 30.0
+    plain = q.enqueue("echo", {"message": "plain"})
+    assert plain["backoff_strategy"] == "none"
+    assert plain["backoff_base_seconds"] == 1.0
+    assert plain["backoff_cap_seconds"] == 60.0
+
+
+def test_backoff_endpoint():
+    import app.main as main
+
+    q = fresh_queue()
+    old_jobs = main.jobs
+    main.jobs = q
+    try:
+        job = main.enqueue(main.EnqueueRequest(
+            handler="echo", payload={"message": "hi"},
+            backoff_strategy="exponential", backoff_base_seconds=2.0,
+            backoff_cap_seconds=30.0,
+        ))
+        assert job["backoff_strategy"] == "exponential"
+        assert job["backoff_base_seconds"] == 2.0
+        assert job["backoff_cap_seconds"] == 30.0
+    finally:
+        main.jobs = old_jobs
+
+
+def test_batch_enqueue_accepts_backoff_options():
+    q = fresh_queue()
+    created = q.enqueue_many([
+        {"handler": "echo", "payload": {"message": "a"},
+         "backoff_strategy": "exponential", "backoff_base_seconds": 3.0},
+        {"handler": "echo", "payload": {"message": "b"}},
+    ])
+    assert created[0]["backoff_strategy"] == "exponential"
+    assert created[0]["backoff_base_seconds"] == 3.0
+    assert created[1]["backoff_strategy"] == "none"
+
+
+def test_dashboard_counts_backoff_waiting_job_as_scheduled():
+    q = fresh_queue()
+    now = time.time()
+    q.enqueue("nope", {}, max_attempts=3, backoff_strategy="exponential",
+              backoff_base_seconds=3600.0, backoff_cap_seconds=10000.0)
+    q.process_next(now=now)
+    stats = q.dashboard_stats(now=now)
+    assert stats["backlog"]["due_now"] == 0
+    assert stats["backlog"]["scheduled_future"] == 1

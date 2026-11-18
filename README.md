@@ -7,7 +7,7 @@ durability decisions recorded along the way, so you can talk about them in an
 interview.
 
 **Status:** In progress, one feature per day, pushed daily.
-Day 11 is done, 2026-11-17. The project is finished when every item below is checked off.
+Day 12 is done, 2026-11-18. The project is finished when every item below is checked off.
 
 ## What it does so far
 - `POST /jobs`, enqueue a job with a handler name, a payload, and an optional
@@ -58,6 +58,13 @@ Day 11 is done, 2026-11-17. The project is finished when every item below is che
   handler, payload, priority, delay, and timeout, in a single transaction,
   so a batch is all or nothing and a bad item never leaves a partial batch
   behind
+- `POST /jobs` accepts backoff_strategy, backoff_base_seconds, and
+  backoff_cap_seconds, so a failed job waits before its next attempt:
+  exponential waits base, then 2x base, then 4x base, linear adds one
+  base each attempt, constant waits the same base every time, and none,
+  the default, retries at once. Every wait is capped, so a job that
+  fails many times never waits longer than the cap, and a job waiting
+  out its backoff shows up as scheduled for later in `GET /dashboard`
 
 ## Stack
 Python, FastAPI, SQLite for job persistence.
@@ -85,7 +92,7 @@ pytest
 - [x] Day 9, Job timeouts, 2026-11-15
 - [x] Day 10, Dashboard stats endpoint, 2026-11-16
 - [x] Day 11, Batch enqueue, 2026-11-17
-- [ ] Day 12, Backoff strategies, exponential backoff
+- [x] Day 12, Backoff strategies, exponential backoff, 2026-11-18
 - [ ] Day 13, Poison job handling, failure stories
 - [ ] Day 14, Load test, throughput numbers
 - [ ] Day 15, System design writeup, docs/system-design.md
@@ -174,3 +181,20 @@ pytest
   key twice in one batch returns the same job twice. Batches are capped
   at 100 jobs, so one request cannot flood the queue or hold the writer
   lock for long.
+- Backoff is per job, not global, because a handler that calls a flaky
+  third party needs a long wait while a fast local handler can retry at
+  once. The strategy, base, and cap are columns on the job row, so they
+  survive a restart like every other job setting, and the delay is a
+  plain function of the attempt number, so the wait for any attempt is
+  easy to predict and test. A failed job goes back to pending with
+  run_at moved to now plus the delay, so the worker needs no timer and
+  no new state, the claim query already skips jobs whose run time has
+  not arrived, and the dashboard already counts a waiting job as
+  scheduled for later. The default strategy is none, so jobs enqueued
+  without backoff keep the old behaviour of retrying at once, and
+  existing tests and clients are unaffected. Exponential backoff is the
+  usual default to reach for, because it gives a struggling downstream
+  service room to recover while still retrying soon after a short
+  outage, and the cap keeps the worst case wait bounded. A requeued job
+  keeps its backoff settings, so the same policy applies when it runs
+  again.

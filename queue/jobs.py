@@ -1,10 +1,49 @@
-"""SQLite backed job queue with retry, dead letter, idempotency, delayed jobs, priority, multiple workers, progress, cancellation, dead letter inspection, requeue, restart recovery, per handler rate limiting, job timeouts, dashboard stats, and batch enqueue."""
+"""SQLite backed job queue with retry, dead letter, idempotency, delayed jobs, priority, multiple workers, progress, cancellation, dead letter inspection, requeue, restart recovery, per handler rate limiting, job timeouts, dashboard stats, batch enqueue, and backoff strategies."""
 import inspect
 import sqlite3
 import time
 from pathlib import Path
 
 MAX_BATCH_SIZE = 100
+
+BACKOFF_STRATEGIES = ("none", "constant", "linear", "exponential")
+DEFAULT_BACKOFF_BASE_SECONDS = 1.0
+DEFAULT_BACKOFF_CAP_SECONDS = 60.0
+
+
+def _validate_backoff(strategy, base_seconds, cap_seconds):
+    if strategy not in BACKOFF_STRATEGIES:
+        raise ValueError(
+            f"unknown backoff strategy: {strategy}, "
+            f"expected one of {', '.join(BACKOFF_STRATEGIES)}"
+        )
+    if base_seconds <= 0:
+        raise ValueError("backoff_base_seconds must be positive")
+    if cap_seconds <= 0:
+        raise ValueError("backoff_cap_seconds must be positive")
+
+
+def compute_backoff(strategy, base_seconds, attempt, cap_seconds):
+    """Seconds to wait before retrying attempt number attempt, starting at 1.
+
+    Exponential doubles the wait each attempt, base, 2x base, 4x base, and
+    so on, linear adds one base each attempt, constant waits the same base
+    every time, and none waits zero seconds, so the job is due again at
+    once. Every strategy is capped, so a job that fails many times never
+    waits longer than cap_seconds between attempts.
+    """
+    _validate_backoff(strategy, base_seconds, cap_seconds)
+    if attempt < 1:
+        raise ValueError("attempt must be at least 1")
+    if strategy == "none":
+        return 0.0
+    if strategy == "constant":
+        delay = base_seconds
+    elif strategy == "linear":
+        delay = base_seconds * attempt
+    else:
+        delay = base_seconds * (2 ** (attempt - 1))
+    return min(delay, cap_seconds)
 
 HANDLERS = {}
 
@@ -106,7 +145,10 @@ class JobQueue:
             "priority INTEGER NOT NULL DEFAULT 0, claimed_by TEXT, "
             "progress REAL NOT NULL DEFAULT 0, progress_message TEXT, "
             "cancel_requested INTEGER NOT NULL DEFAULT 0, "
-            "timeout_seconds REAL, finished_at REAL)"
+            "timeout_seconds REAL, finished_at REAL, "
+            "backoff_strategy TEXT NOT NULL DEFAULT 'none', "
+            "backoff_base_seconds REAL NOT NULL DEFAULT 1.0, "
+            "backoff_cap_seconds REAL NOT NULL DEFAULT 60.0)"
         )
         conn.execute(
             "CREATE TABLE IF NOT EXISTS rate_limits ("
@@ -136,6 +178,18 @@ class JobQueue:
             conn.execute("ALTER TABLE jobs ADD COLUMN timeout_seconds REAL")
         if "finished_at" not in columns:
             conn.execute("ALTER TABLE jobs ADD COLUMN finished_at REAL")
+        if "backoff_strategy" not in columns:
+            conn.execute(
+                "ALTER TABLE jobs ADD COLUMN backoff_strategy TEXT NOT NULL DEFAULT 'none'"
+            )
+        if "backoff_base_seconds" not in columns:
+            conn.execute(
+                "ALTER TABLE jobs ADD COLUMN backoff_base_seconds REAL NOT NULL DEFAULT 1.0"
+            )
+        if "backoff_cap_seconds" not in columns:
+            conn.execute(
+                "ALTER TABLE jobs ADD COLUMN backoff_cap_seconds REAL NOT NULL DEFAULT 60.0"
+            )
         conn.commit()
         conn.close()
         self.last_recovery = self.recover_orphans()
@@ -199,11 +253,16 @@ class JobQueue:
         return conn
 
     def enqueue(self, handler_name, payload, max_attempts=3, idempotency_key=None,
-                run_at=None, delay_seconds=None, priority=0, timeout_seconds=None):
+                run_at=None, delay_seconds=None, priority=0, timeout_seconds=None,
+                backoff_strategy="none",
+                backoff_base_seconds=DEFAULT_BACKOFF_BASE_SECONDS,
+                backoff_cap_seconds=DEFAULT_BACKOFF_CAP_SECONDS):
         import json
 
         if timeout_seconds is not None and timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
+        _validate_backoff(backoff_strategy, backoff_base_seconds,
+                          backoff_cap_seconds)
         conn = self._conn()
         if idempotency_key:
             row = conn.execute(
@@ -221,10 +280,11 @@ class JobQueue:
         else:
             effective_run_at = now
         cur = conn.execute(
-            "INSERT INTO jobs (handler, payload, max_attempts, idempotency_key, created_at, run_at, priority, timeout_seconds)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO jobs (handler, payload, max_attempts, idempotency_key, created_at, run_at, priority, timeout_seconds, backoff_strategy, backoff_base_seconds, backoff_cap_seconds)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (handler_name, json.dumps(payload), max_attempts, idempotency_key, now,
-             effective_run_at, priority, timeout_seconds),
+             effective_run_at, priority, timeout_seconds, backoff_strategy,
+             backoff_base_seconds, backoff_cap_seconds),
         )
         job_id = cur.lastrowid
         conn.commit()
@@ -237,7 +297,8 @@ class JobQueue:
 
         specs is a list of dicts, each with the same keys enqueue accepts:
         handler, payload, max_attempts, idempotency_key, run_at,
-        delay_seconds, priority, timeout_seconds. Every spec is validated
+        delay_seconds, priority, timeout_seconds, backoff_strategy,
+        backoff_base_seconds, backoff_cap_seconds. Every spec is validated
         before anything is inserted, and the whole batch is committed once,
         so a bad item fails the batch with no partial enqueue. A spec whose
         idempotency key already exists returns that existing job instead of
@@ -260,6 +321,11 @@ class JobQueue:
             timeout = spec.get("timeout_seconds")
             if timeout is not None and timeout <= 0:
                 raise ValueError("timeout_seconds must be positive")
+            _validate_backoff(
+                spec.get("backoff_strategy", "none"),
+                spec.get("backoff_base_seconds", DEFAULT_BACKOFF_BASE_SECONDS),
+                spec.get("backoff_cap_seconds", DEFAULT_BACKOFF_CAP_SECONDS),
+            )
         now = time.time()
         conn = self._conn()
         conn.isolation_level = None
@@ -285,8 +351,8 @@ class JobQueue:
                 else:
                     effective_run_at = now
                 cur = conn.execute(
-                    "INSERT INTO jobs (handler, payload, max_attempts, idempotency_key, created_at, run_at, priority, timeout_seconds)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO jobs (handler, payload, max_attempts, idempotency_key, created_at, run_at, priority, timeout_seconds, backoff_strategy, backoff_base_seconds, backoff_cap_seconds)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         spec["handler"],
                         json.dumps(spec.get("payload", {})),
@@ -296,6 +362,13 @@ class JobQueue:
                         effective_run_at,
                         spec.get("priority", 0),
                         spec.get("timeout_seconds"),
+                        spec.get("backoff_strategy", "none"),
+                        spec.get(
+                            "backoff_base_seconds", DEFAULT_BACKOFF_BASE_SECONDS
+                        ),
+                        spec.get(
+                            "backoff_cap_seconds", DEFAULT_BACKOFF_CAP_SECONDS
+                        ),
                     ),
                 )
                 row = conn.execute(
@@ -722,6 +795,14 @@ class JobQueue:
         timeout_seconds, with a timed out error, and is then retried or dead
         lettered like any other failure. A job with no timeout waits as long
         as its handler takes.
+
+        A failed job with attempts left is not due again at once, it waits
+        out its backoff, so run_at moves to now plus the delay for the
+        attempt that just failed. The default strategy is none, so a job
+        with no backoff configured retries at once, exactly as before.
+        Exponential backoff waits base, then 2x base, then 4x base, capped
+        at backoff_cap_seconds, so a failing handler gets breathing room
+        without waiting forever.
         """
         import json
 
@@ -764,9 +845,13 @@ class JobQueue:
                     (str(exc), attempts, now, job["id"]),
                 )
             else:
+                delay = compute_backoff(
+                    job["backoff_strategy"], job["backoff_base_seconds"],
+                    attempts, job["backoff_cap_seconds"],
+                )
                 conn.execute(
-                    "UPDATE jobs SET status = 'pending', error = ?, attempts = ? WHERE id = ?",
-                    (str(exc), attempts, job["id"]),
+                    "UPDATE jobs SET status = 'pending', error = ?, attempts = ?, run_at = ? WHERE id = ?",
+                    (str(exc), attempts, now + delay, job["id"]),
                 )
             conn.commit()
             conn.close()

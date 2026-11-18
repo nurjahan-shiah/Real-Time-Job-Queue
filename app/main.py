@@ -1,8 +1,12 @@
-"""HTTP API around the job queue, including delayed jobs, priority, progress, cancellation, dead letter requeue, restart recovery, per handler rate limiting, job timeouts, dashboard stats, and batch enqueue."""
+"""HTTP API around the job queue, including delayed jobs, priority, progress, cancellation, dead letter requeue, restart recovery, per handler rate limiting, job timeouts, dashboard stats, batch enqueue, and backoff strategies."""
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-from queue.jobs import JobQueue
+from queue.jobs import (
+    DEFAULT_BACKOFF_BASE_SECONDS,
+    DEFAULT_BACKOFF_CAP_SECONDS,
+    JobQueue,
+)
 
 app = FastAPI(title="Real Time Job Queue")
 jobs = JobQueue()
@@ -17,6 +21,9 @@ class EnqueueRequest(BaseModel):
     delay_seconds: float | None = None
     priority: int = 0
     timeout_seconds: float | None = None
+    backoff_strategy: str = "none"
+    backoff_base_seconds: float = DEFAULT_BACKOFF_BASE_SECONDS
+    backoff_cap_seconds: float = DEFAULT_BACKOFF_CAP_SECONDS
 
 
 @app.post("/jobs")
@@ -26,6 +33,9 @@ def enqueue(req: EnqueueRequest):
             req.handler, req.payload, req.max_attempts, req.idempotency_key,
             run_at=req.run_at, delay_seconds=req.delay_seconds,
             priority=req.priority, timeout_seconds=req.timeout_seconds,
+            backoff_strategy=req.backoff_strategy,
+            backoff_base_seconds=req.backoff_base_seconds,
+            backoff_cap_seconds=req.backoff_cap_seconds,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
