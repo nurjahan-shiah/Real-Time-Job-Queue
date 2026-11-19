@@ -1,10 +1,14 @@
-"""SQLite backed job queue with retry, dead letter, idempotency, delayed jobs, priority, multiple workers, progress, cancellation, dead letter inspection, requeue, restart recovery, per handler rate limiting, job timeouts, dashboard stats, batch enqueue, and backoff strategies."""
+"""SQLite backed job queue with retry, dead letter, idempotency, delayed jobs, priority, multiple workers, progress, cancellation, dead letter inspection, requeue, restart recovery, per handler rate limiting, job timeouts, dashboard stats, batch enqueue, backoff strategies, poison job handling, and failure stories."""
 import inspect
 import sqlite3
 import time
 from pathlib import Path
 
 MAX_BATCH_SIZE = 100
+
+# A job that fails with the same error this many times in a row is poison,
+# its failure is deterministic, so retrying it can never help.
+POISON_SAME_ERROR_THRESHOLD = 3
 
 BACKOFF_STRATEGIES = ("none", "constant", "linear", "exponential")
 DEFAULT_BACKOFF_BASE_SECONDS = 1.0
@@ -161,6 +165,12 @@ class JobQueue:
             "id INTEGER PRIMARY KEY AUTOINCREMENT, "
             "handler TEXT NOT NULL, started_at REAL NOT NULL)"
         )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS job_failures ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "job_id INTEGER NOT NULL, attempt INTEGER NOT NULL, "
+            "error TEXT NOT NULL, failed_at REAL NOT NULL)"
+        )
         columns = [r[1] for r in conn.execute("PRAGMA table_info(jobs)")]
         if "run_at" not in columns:
             conn.execute("ALTER TABLE jobs ADD COLUMN run_at REAL NOT NULL DEFAULT 0")
@@ -190,6 +200,10 @@ class JobQueue:
             conn.execute(
                 "ALTER TABLE jobs ADD COLUMN backoff_cap_seconds REAL NOT NULL DEFAULT 60.0"
             )
+        if "poison" not in columns:
+            conn.execute(
+                "ALTER TABLE jobs ADD COLUMN poison INTEGER NOT NULL DEFAULT 0"
+            )
         conn.commit()
         conn.close()
         self.last_recovery = self.recover_orphans()
@@ -212,7 +226,9 @@ class JobQueue:
         promptly. A job already out of attempts is dead lettered with an
         error saying the worker died while it was running. A cancel request
         is kept, so a job the user asked to cancel still ends as cancelled
-        when it runs again.
+        when it runs again. The crash is recorded in the job failure story,
+        so a job that keeps crashing its worker has a visible history of it,
+        instead of only a bare attempt count.
         """
         conn = self._conn()
         now = time.time()
@@ -240,6 +256,12 @@ class JobQueue:
                     (attempts, job["id"]),
                 )
                 recovered.append(job["id"])
+            conn.execute(
+                "INSERT INTO job_failures (job_id, attempt, error, failed_at) "
+                "VALUES (?, ?, ?, ?)",
+                (job["id"], attempts,
+                 "worker died while job was running, recovered on restart", now),
+            )
         conn.commit()
         conn.close()
         return {"recovered": len(recovered), "dead": len(dead),
@@ -414,9 +436,10 @@ class JobQueue:
         for later, with the age of the oldest pending job, throughput counts
         jobs that finished in the last minute and the last hour from
         finished_at, recent_dead is the newest dead jobs with their errors,
-        rate_limits is the live budget of every capped handler, and recovery
-        is what the last startup recovered. It is a read only summary over
-        the jobs table, so it can never drift from the data it reports on.
+        poison_jobs counts jobs dead lettered as poison, rate_limits is the
+        live budget of every capped handler, and recovery is what the last
+        startup recovered. It is a read only summary over the jobs table, so
+        it can never drift from the data it reports on.
         """
         if now is None:
             now = time.time()
@@ -469,9 +492,12 @@ class JobQueue:
             (now - 3600,),
         ).fetchone()["n"]
         recent_dead = conn.execute(
-            "SELECT id, handler, error, attempts, finished_at FROM jobs "
+            "SELECT id, handler, error, attempts, poison, finished_at FROM jobs "
             "WHERE status = 'dead' ORDER BY id DESC LIMIT 5"
         ).fetchall()
+        poison_jobs = conn.execute(
+            "SELECT COUNT(*) AS n FROM jobs WHERE poison = 1"
+        ).fetchone()["n"]
         conn.close()
         return {
             "total_jobs": sum(by_status.values()),
@@ -490,6 +516,7 @@ class JobQueue:
                 "dead_last_hour": dead_hour,
             },
             "recent_dead": [dict(r) for r in recent_dead],
+            "poison_jobs": poison_jobs,
             "rate_limits": [
                 self.rate_limit_status(limit["handler"], now=now)
                 for limit in self.list_rate_limits()
@@ -557,6 +584,71 @@ class JobQueue:
         conn.close()
         return [dict(r) for r in rows]
 
+    def _record_failure(self, conn, job_id, attempt, error, failed_at):
+        """Save one failed attempt, so the job keeps a failure story.
+
+        One row per failed attempt, with the attempt number, the error, and
+        when it failed. GET /jobs/{id}/failures reads these rows, so a dead
+        job shows the sequence of errors that killed it, not just the last
+        one, which is how you tell a poison job from an unlucky one.
+        """
+        conn.execute(
+            "INSERT INTO job_failures (job_id, attempt, error, failed_at) "
+            "VALUES (?, ?, ?, ?)",
+            (job_id, attempt, error, failed_at),
+        )
+
+    def _consecutive_same_errors(self, conn, job_id, error):
+        """How many of the newest failures in a row carry this same error.
+
+        Reads the failure story newest first and counts the leading run that
+        matches error, so a job that fails the same way every time is spotted
+        as poison, while a job whose error keeps changing is not.
+        """
+        rows = conn.execute(
+            "SELECT error FROM job_failures WHERE job_id = ? "
+            "ORDER BY attempt DESC, id DESC LIMIT ?",
+            (job_id, POISON_SAME_ERROR_THRESHOLD),
+        ).fetchall()
+        count = 0
+        for row in rows:
+            if row["error"] != error:
+                break
+            count += 1
+        return count
+
+    def list_failures(self, job_id):
+        """The failure story of one job, oldest failure first.
+
+        One row per failed attempt, with the attempt number, the error, and
+        when it failed, so you can see whether a job failed the same way
+        every time or a new way each time. A job that never failed has no
+        rows, and a requeued job starts with an empty story.
+        """
+        conn = self._conn()
+        rows = conn.execute(
+            "SELECT id, job_id, attempt, error, failed_at FROM job_failures "
+            "WHERE job_id = ? ORDER BY attempt ASC, id ASC",
+            (job_id,),
+        ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+
+    def list_poison(self, limit=50):
+        """Jobs dead lettered as poison, newest first.
+
+        A poison job is one that failed with the same error enough times in
+        a row that retrying it would never help, so it was dead lettered
+        early instead of burning its remaining attempts.
+        """
+        conn = self._conn()
+        rows = conn.execute(
+            "SELECT * FROM jobs WHERE poison = 1 ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+
     def requeue(self, job_id):
         """Put a dead job back in the queue. Returns the job, or None when it does not exist.
 
@@ -565,7 +657,9 @@ class JobQueue:
         requeued job keeps its handler, payload, priority, and idempotency
         key, but attempts, error, result, and progress are cleared, and
         run_at is set to now, so it runs again promptly with a fresh
-        attempt budget.
+        attempt budget. The failure story and the poison flag are cleared
+        too, so the fixed job starts its new attempt budget with a clean
+        story.
         """
         job = self.get(job_id)
         if job is None:
@@ -577,9 +671,10 @@ class JobQueue:
             "UPDATE jobs SET status = 'pending', attempts = 0, error = NULL, "
             "result = NULL, progress = 0, progress_message = NULL, "
             "cancel_requested = 0, claimed_by = NULL, finished_at = NULL, "
-            "run_at = ? WHERE id = ?",
+            "poison = 0, run_at = ? WHERE id = ?",
             (time.time(), job_id),
         )
+        conn.execute("DELETE FROM job_failures WHERE job_id = ?", (job_id,))
         conn.commit()
         conn.close()
         return self.get(job_id)
@@ -803,6 +898,14 @@ class JobQueue:
         Exponential backoff waits base, then 2x base, then 4x base, capped
         at backoff_cap_seconds, so a failing handler gets breathing room
         without waiting forever.
+
+        Every failed attempt is recorded in the job failure story, with the
+        attempt number, the error, and the time, so GET /jobs/{id}/failures
+        shows how a job died. A job that fails with the same error
+        3 times in a row is poison, it is dead lettered at once with a
+        poison flag instead of burning its remaining attempts and backoff
+        waits, because a failure that never changes will never succeed on
+        a retry.
         """
         import json
 
@@ -834,15 +937,27 @@ class JobQueue:
         except Exception as exc:  # noqa: BLE001, retry then dead letter
             conn = self._conn()
             attempts = job["attempts"] + 1
+            error = str(exc)
+            self._record_failure(conn, job["id"], attempts, error, now)
+            poison = (
+                self._consecutive_same_errors(conn, job["id"], error)
+                >= POISON_SAME_ERROR_THRESHOLD
+            )
             if self.is_cancel_requested(job["id"]):
                 conn.execute(
                     "UPDATE jobs SET status = 'cancelled', error = ?, attempts = ?, finished_at = ? WHERE id = ?",
-                    (str(exc), attempts, now, job["id"]),
+                    (error, attempts, now, job["id"]),
+                )
+            elif poison:
+                conn.execute(
+                    "UPDATE jobs SET status = 'dead', error = ?, attempts = ?, poison = 1, finished_at = ? WHERE id = ?",
+                    (f"poison job, failed {POISON_SAME_ERROR_THRESHOLD} times with the same error: {error}",
+                     attempts, now, job["id"]),
                 )
             elif attempts >= job["max_attempts"]:
                 conn.execute(
                     "UPDATE jobs SET status = 'dead', error = ?, attempts = ?, finished_at = ? WHERE id = ?",
-                    (str(exc), attempts, now, job["id"]),
+                    (error, attempts, now, job["id"]),
                 )
             else:
                 delay = compute_backoff(
@@ -851,7 +966,7 @@ class JobQueue:
                 )
                 conn.execute(
                     "UPDATE jobs SET status = 'pending', error = ?, attempts = ?, run_at = ? WHERE id = ?",
-                    (str(exc), attempts, now + delay, job["id"]),
+                    (error, attempts, now + delay, job["id"]),
                 )
             conn.commit()
             conn.close()

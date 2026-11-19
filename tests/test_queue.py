@@ -1095,3 +1095,221 @@ def test_dashboard_counts_backoff_waiting_job_as_scheduled():
     stats = q.dashboard_stats(now=now)
     assert stats["backlog"]["due_now"] == 0
     assert stats["backlog"]["scheduled_future"] == 1
+
+
+def test_failure_story_records_each_attempt():
+    q = fresh_queue()
+    job = q.enqueue("nope", {}, max_attempts=2)
+    q.process_next()
+    q.process_next()
+    failures = q.list_failures(job["id"])
+    assert len(failures) == 2
+    assert [f["attempt"] for f in failures] == [1, 2]
+    assert all("unknown handler" in f["error"] for f in failures)
+    assert all(f["failed_at"] > 0 for f in failures)
+    assert q.get(job["id"])["status"] == "dead"
+
+
+def test_poison_job_dead_lettered_early():
+    q = fresh_queue()
+
+    def always_broken(payload):
+        raise RuntimeError("always broken")
+
+    HANDLERS["always_broken"] = always_broken
+    job = q.enqueue("always_broken", {}, max_attempts=5)
+    q.process_next()
+    assert q.get(job["id"])["status"] == "pending"
+    q.process_next()
+    assert q.get(job["id"])["status"] == "pending"
+    done = q.process_next()
+    assert done["status"] == "dead"
+    assert done["attempts"] == 3
+    assert done["poison"] == 1
+    assert "poison job" in done["error"]
+    assert "always broken" in done["error"]
+    assert q.process_next() is None
+    assert q.get(job["id"])["status"] == "dead"
+
+
+def test_changing_errors_are_not_poison():
+    q = fresh_queue()
+    calls = {"n": 0}
+
+    def changing(payload):
+        calls["n"] += 1
+        raise RuntimeError(f"failure number {calls['n']}")
+
+    HANDLERS["changing"] = changing
+    job = q.enqueue("changing", {}, max_attempts=5)
+    for _ in range(3):
+        q.process_next()
+    mid = q.get(job["id"])
+    assert mid["status"] == "pending"
+    assert mid["attempts"] == 3
+    assert mid["poison"] == 0
+    q.process_next()
+    q.process_next()
+    done = q.get(job["id"])
+    assert done["status"] == "dead"
+    assert done["poison"] == 0
+    assert len(q.list_failures(job["id"])) == 5
+
+
+def test_poison_after_mixed_errors():
+    q = fresh_queue()
+    errors = ["first error", "second error", "second error", "second error"]
+    calls = {"n": 0}
+
+    def mixed(payload):
+        error = errors[calls["n"]]
+        calls["n"] += 1
+        raise RuntimeError(error)
+
+    HANDLERS["mixed"] = mixed
+    job = q.enqueue("mixed", {}, max_attempts=5)
+    for _ in range(3):
+        q.process_next()
+    assert q.get(job["id"])["status"] == "pending"
+    done = q.process_next()
+    assert done["status"] == "dead"
+    assert done["poison"] == 1
+    assert "second error" in done["error"]
+
+
+def test_timeout_failures_are_poison():
+    q = fresh_queue()
+    job = q.enqueue("hang", {"seconds": 0.5}, timeout_seconds=0.05, max_attempts=5)
+    q.process_next()
+    q.process_next()
+    done = q.process_next()
+    assert done["status"] == "dead"
+    assert done["attempts"] == 3
+    assert done["poison"] == 1
+    assert "timed out" in done["error"]
+    failures = q.list_failures(job["id"])
+    assert len(failures) == 3
+    assert all("timed out" in f["error"] for f in failures)
+
+
+def test_poison_skips_remaining_backoff():
+    q = fresh_queue()
+
+    def always_broken(payload):
+        raise RuntimeError("always broken")
+
+    HANDLERS["always_broken"] = always_broken
+    job = q.enqueue("always_broken", {}, max_attempts=5, run_at=1000,
+                    backoff_strategy="exponential", backoff_base_seconds=100.0,
+                    backoff_cap_seconds=1000.0)
+    q.process_next(now=1000)
+    q.process_next(now=1100)
+    done = q.process_next(now=1300)
+    assert done["status"] == "dead"
+    assert done["attempts"] == 3
+    assert done["poison"] == 1
+
+
+def test_requeue_clears_failure_story_and_poison():
+    q = fresh_queue()
+
+    def always_broken(payload):
+        raise RuntimeError("always broken")
+
+    HANDLERS["always_broken"] = always_broken
+    job = q.enqueue("always_broken", {}, max_attempts=5)
+    for _ in range(3):
+        q.process_next()
+    dead = q.get(job["id"])
+    assert dead["poison"] == 1
+    assert len(q.list_failures(job["id"])) == 3
+    again = q.requeue(job["id"])
+    assert again["status"] == "pending"
+    assert again["poison"] == 0
+    assert again["attempts"] == 0
+    assert q.list_failures(job["id"]) == []
+
+
+def test_healthy_job_has_empty_failure_story():
+    q = fresh_queue()
+    job = q.enqueue("echo", {"message": "hi"})
+    q.process_next()
+    assert q.list_failures(job["id"]) == []
+
+
+def test_failures_endpoint():
+    import pytest
+    from fastapi import HTTPException
+
+    import app.main as main
+
+    q = fresh_queue()
+    old_jobs = main.jobs
+    main.jobs = q
+    try:
+        job = main.enqueue(main.EnqueueRequest(handler="nope", payload={}, max_attempts=1))
+        main.process_next()
+        story = main.job_failures(job["id"])
+        assert story["job_id"] == job["id"]
+        assert story["failure_count"] == 1
+        assert len(story["failures"]) == 1
+        assert "unknown handler" in story["failures"][0]["error"]
+        assert story["distinct_errors"] == ["unknown handler: nope"]
+        assert story["poison"] is False
+        with pytest.raises(HTTPException):
+            main.job_failures(9999)
+    finally:
+        main.jobs = old_jobs
+
+
+def test_poison_endpoint():
+    import app.main as main
+
+    q = fresh_queue()
+    old_jobs = main.jobs
+    main.jobs = q
+    try:
+        assert main.list_poison() == []
+
+        def always_broken(payload):
+            raise RuntimeError("always broken")
+
+        HANDLERS["always_broken"] = always_broken
+        job = q.enqueue("always_broken", {}, max_attempts=5)
+        for _ in range(3):
+            q.process_next()
+        poison = main.list_poison()
+        assert len(poison) == 1
+        assert poison[0]["id"] == job["id"]
+        assert poison[0]["poison"] == 1
+    finally:
+        main.jobs = old_jobs
+
+
+def test_failure_story_includes_worker_crash():
+    q = fresh_queue()
+    job = q.enqueue("echo", {"message": "hi"})
+    crash_job(q, job["id"], attempts=0, progress=50)
+    q2 = JobQueue(db_path=q.db_path)
+    failures = q2.list_failures(job["id"])
+    assert len(failures) == 1
+    assert failures[0]["attempt"] == 1
+    assert "worker died" in failures[0]["error"]
+    assert q2.get(job["id"])["status"] == "pending"
+
+
+def test_dashboard_counts_poison_jobs():
+    q = fresh_queue()
+
+    def always_broken(payload):
+        raise RuntimeError("always broken")
+
+    HANDLERS["always_broken"] = always_broken
+    job = q.enqueue("always_broken", {}, max_attempts=5)
+    for _ in range(3):
+        q.process_next()
+    stats = q.dashboard_stats()
+    assert stats["poison_jobs"] == 1
+    assert len(stats["recent_dead"]) == 1
+    assert stats["recent_dead"][0]["poison"] == 1
+    assert "poison job" in stats["recent_dead"][0]["error"]

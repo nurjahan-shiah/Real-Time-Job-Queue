@@ -1,4 +1,4 @@
-"""HTTP API around the job queue, including delayed jobs, priority, progress, cancellation, dead letter requeue, restart recovery, per handler rate limiting, job timeouts, dashboard stats, batch enqueue, and backoff strategies."""
+"""HTTP API around the job queue, including delayed jobs, priority, progress, cancellation, dead letter requeue, restart recovery, per handler rate limiting, job timeouts, dashboard stats, batch enqueue, backoff strategies, poison job handling, and failure stories."""
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
@@ -75,6 +75,30 @@ def requeue_job(job_id: int):
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
     return job
+
+
+@app.get("/jobs/{job_id}/failures")
+def job_failures(job_id: int):
+    job = jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    failures = jobs.list_failures(job_id)
+    distinct = []
+    for failure in failures:
+        if failure["error"] not in distinct:
+            distinct.append(failure["error"])
+    return {
+        "job_id": job_id,
+        "failures": failures,
+        "failure_count": len(failures),
+        "distinct_errors": distinct,
+        "poison": bool(job.get("poison")),
+    }
+
+
+@app.get("/poison")
+def list_poison():
+    return jobs.list_poison()
 
 
 @app.get("/dead")

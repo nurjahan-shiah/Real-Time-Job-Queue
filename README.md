@@ -7,7 +7,7 @@ durability decisions recorded along the way, so you can talk about them in an
 interview.
 
 **Status:** In progress, one feature per day, pushed daily.
-Day 12 is done, 2026-11-18. The project is finished when every item below is checked off.
+Day 13 is done, 2026-11-19. The project is finished when every item below is checked off.
 
 ## What it does so far
 - `POST /jobs`, enqueue a job with a handler name, a payload, and an optional
@@ -65,6 +65,13 @@ Day 12 is done, 2026-11-18. The project is finished when every item below is che
   the default, retries at once. Every wait is capped, so a job that
   fails many times never waits longer than the cap, and a job waiting
   out its backoff shows up as scheduled for later in `GET /dashboard`
+- Every failed attempt is recorded in a failure story, so
+  `GET /jobs/{id}/failures` shows each attempt, its error, and when it
+  failed, and a job that fails with the same error 3 times in a row is
+  flagged as poison and dead lettered early, so it stops burning attempts
+  and backoff waits on a failure that can never succeed. `GET /poison`
+  lists poison jobs, the dashboard counts them, and requeue clears the
+  story and the flag, so a fixed job starts fresh
 
 ## Stack
 Python, FastAPI, SQLite for job persistence.
@@ -93,7 +100,7 @@ pytest
 - [x] Day 10, Dashboard stats endpoint, 2026-11-16
 - [x] Day 11, Batch enqueue, 2026-11-17
 - [x] Day 12, Backoff strategies, exponential backoff, 2026-11-18
-- [ ] Day 13, Poison job handling, failure stories
+- [x] Day 13, Poison job handling, failure stories, 2026-11-19
 - [ ] Day 14, Load test, throughput numbers
 - [ ] Day 15, System design writeup, docs/system-design.md
 - [ ] Day 16, Scheduled recurring jobs
@@ -198,3 +205,17 @@ pytest
   outage, and the cap keeps the worst case wait bounded. A requeued job
   keeps its backoff settings, so the same policy applies when it runs
   again.
+- A poison job is one that fails with the same error 3 times in a row,
+  which means the failure is deterministic, a bad payload, a missing
+  handler, or a handler that always times out, so retrying it can never
+  help. It is dead lettered early with a poison flag and an error that
+  names the repeated error, instead of burning its remaining attempts
+  and backoff waits. The threshold is 3, not 2, so a job that fails twice
+  while a fix is being deployed is not cut off early, and jobs with only
+  3 attempts are unaffected, since they would die on the third attempt
+  anyway. Every failed attempt is recorded in a job_failures table with
+  its attempt number, error, and time, including worker crashes found on
+  restart, so the failure story shows whether a job failed the same way
+  every time or a new way each time. Requeue clears the story and the
+  poison flag, so a fixed job starts its new attempt budget with a clean
+  story.
