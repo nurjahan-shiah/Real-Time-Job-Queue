@@ -4,6 +4,7 @@ import time
 from pathlib import Path
 
 from queue.jobs import BACKOFF_STRATEGIES, HANDLERS, MAX_BATCH_SIZE, JobQueue, compute_backoff
+from queue.loadtest import format_results, run_load_test
 from queue.workers import Worker, run_workers
 
 
@@ -1313,3 +1314,72 @@ def test_dashboard_counts_poison_jobs():
     assert len(stats["recent_dead"]) == 1
     assert stats["recent_dead"][0]["poison"] == 1
     assert "poison job" in stats["recent_dead"][0]["error"]
+
+
+def test_load_test_completes_all_jobs():
+    results = run_load_test(n=40, workers=4)
+    assert results["jobs_enqueued"] == 40
+    assert results["workers"] == 4
+    assert results["completed"] == 40
+    assert results["dead"] == 0
+    assert results["cancelled"] == 0
+    assert results["timed_out"] is False
+    assert results["elapsed_seconds"] > 0
+    assert results["jobs_per_second"] > 0
+    assert sum(results["per_worker"].values()) == 40
+    assert set(results["per_worker"]).issubset(
+        {f"worker-{i}" for i in range(1, 5)}
+    )
+
+
+def test_load_test_reports_enqueue_throughput():
+    results = run_load_test(n=40, workers=2)
+    assert results["enqueue_seconds"] > 0
+    assert results["enqueue_jobs_per_second"] > 0
+    assert results["completed"] == 40
+
+
+def test_load_test_mean_latency_is_measured():
+    results = run_load_test(n=20, workers=2)
+    assert results["completed"] == 20
+    assert results["mean_latency_seconds"] is not None
+    assert results["mean_latency_seconds"] >= 0
+    assert results["mean_latency_seconds"] <= results["elapsed_seconds"] + 1
+
+
+def test_load_test_counts_dead_jobs():
+    results = run_load_test(n=6, workers=2, handler="nope")
+    assert results["completed"] == 0
+    assert results["dead"] == 6
+    assert results["timed_out"] is False
+    assert results["mean_latency_seconds"] is None
+
+
+def test_load_test_rejects_bad_counts():
+    import pytest
+
+    with pytest.raises(ValueError):
+        run_load_test(n=0, workers=2)
+    with pytest.raises(ValueError):
+        run_load_test(n=10, workers=0)
+
+
+def test_load_test_format_results():
+    results = run_load_test(n=10, workers=1)
+    text = format_results(results)
+    assert "10 jobs" in text
+    assert "1 workers" in text
+    assert "jobs per second" in text
+    assert "Completed 10" in text
+    assert "Mean latency" in text
+    assert "Jobs per worker" in text
+    assert "Timed out" not in text
+
+
+def test_load_test_cli_runs(capsys):
+    from queue.loadtest import main
+
+    assert main(["20", "2"]) == 0
+    out = capsys.readouterr().out
+    assert "20 jobs" in out
+    assert "Completed 20" in out

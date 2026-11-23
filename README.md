@@ -7,7 +7,7 @@ durability decisions recorded along the way, so you can talk about them in an
 interview.
 
 **Status:** In progress, one feature per day, pushed daily.
-Day 13 is done, 2026-11-19. The project is finished when every item below is checked off.
+Day 14 is done, 2026-11-20. The project is finished when every item below is checked off.
 
 ## What it does so far
 - `POST /jobs`, enqueue a job with a handler name, a payload, and an optional
@@ -72,6 +72,10 @@ Day 13 is done, 2026-11-19. The project is finished when every item below is che
   and backoff waits on a failure that can never succeed. `GET /poison`
   lists poison jobs, the dashboard counts them, and requeue clears the
   story and the flag, so a fixed job starts fresh
+- `python -m queue.loadtest [jobs] [workers]` runs a load test and prints
+  real throughput numbers, enqueue rate, processing rate in jobs per
+  second, mean latency from enqueue to completion, and jobs per worker,
+  so you can quote measured numbers instead of guessing
 
 ## Stack
 Python, FastAPI, SQLite for job persistence.
@@ -101,7 +105,7 @@ pytest
 - [x] Day 11, Batch enqueue, 2026-11-17
 - [x] Day 12, Backoff strategies, exponential backoff, 2026-11-18
 - [x] Day 13, Poison job handling, failure stories, 2026-11-19
-- [ ] Day 14, Load test, throughput numbers
+- [x] Day 14, Load test, throughput numbers, 2026-11-20
 - [ ] Day 15, System design writeup, docs/system-design.md
 - [ ] Day 16, Scheduled recurring jobs
 - [ ] Day 17, Final polish, interview talking points, project complete
@@ -219,3 +223,18 @@ pytest
   every time or a new way each time. Requeue clears the story and the
   poison flag, so a fixed job starts its new attempt budget with a clean
   story.
+- The load test enqueues and drains real jobs against a throwaway
+  database, so it measures the real claim, run, and finish path, not a
+  mock of it, and it never touches the real jobs.db. It reports enqueue
+  rate, processing rate, mean latency from enqueue to completion, and
+  jobs per worker, and it stops cleanly on a timeout, so a slow run still
+  reports what it finished instead of hanging. Measured on the dev
+  machine, 2026-11-20: 500 trivial sum jobs ran at about 361 jobs per
+  second with 4 workers and about 399 with 1 worker, so extra workers do
+  not help when the handler is trivial, because SQLite serialises the
+  writers and the claim is the bottleneck. With a handler that sleeps
+  50 ms per job, 4 workers ran at about 67 jobs per second against about
+  19 with 1 worker, about 3.6x faster, so the workers pay off when
+  handlers do real work. Enqueue runs at about 30,000 jobs per second in
+  batches of 100, and mean latency for the 500 job run was about 0.7
+  seconds, most of it queueing, not handler time.
