@@ -7,7 +7,7 @@ durability decisions recorded along the way, so you can talk about them in an
 interview.
 
 **Status:** In progress, one feature per day, pushed daily.
-Day 14 is done, 2026-11-20. The project is finished when every item below is checked off.
+Day 15 is done, 2026-11-24. The project is finished when every item below is checked off.
 
 ## What it does so far
 - `POST /jobs`, enqueue a job with a handler name, a payload, and an optional
@@ -76,6 +76,10 @@ Day 14 is done, 2026-11-20. The project is finished when every item below is che
   real throughput numbers, enqueue rate, processing rate in jobs per
   second, mean latency from enqueue to completion, and jobs per worker,
   so you can quote measured numbers instead of guessing
+- `docs/system-design.md` records the full design, architecture, data
+  model, lifecycle, claiming, retries, rate limiting, recovery,
+  measured performance, limits, failure modes, and what would change
+  at larger scale, so the decisions are written down in one place
 
 ## Stack
 Python, FastAPI, SQLite for job persistence.
@@ -106,7 +110,7 @@ pytest
 - [x] Day 12, Backoff strategies, exponential backoff, 2026-11-18
 - [x] Day 13, Poison job handling, failure stories, 2026-11-19
 - [x] Day 14, Load test, throughput numbers, 2026-11-20
-- [ ] Day 15, System design writeup, docs/system-design.md
+- [x] Day 15, System design writeup, docs/system-design.md, 2026-11-24
 - [ ] Day 16, Scheduled recurring jobs
 - [ ] Day 17, Final polish, interview talking points, project complete
 
@@ -238,3 +242,9 @@ pytest
   handlers do real work. Enqueue runs at about 30,000 jobs per second in
   batches of 100, and mean latency for the 500 job run was about 0.7
   seconds, most of it queueing, not handler time.
+- The system design writeup lives in docs/system-design.md, and it is
+  checked by tests, so the doc cannot drift from the code without a
+  failing test. It quotes the measured load test numbers with the
+  machine and the job count, and it names the limits plainly, one
+  SQLite writer, polling workers, and threads that cannot be killed,
+  so the next scale step is a Postgres move, not a surprise.
